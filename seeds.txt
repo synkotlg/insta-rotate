@@ -1,0 +1,67 @@
+# Comptes sources : le script s'abonne a des abonnes de ces comptes (un pseudo par ligne, sans @).
+# Les pseudos sont ecrits de memoire : lance `insta_rotate.py check-seeds` une fois, il ecarte ceux qui n'existent pas.
+# Lignes vides et texte apres un # ignores. Une seule source par passage, en rotation dans l'ordre de ce fichier
+# (la suivante seulement si elle est epuisee ou inaccessible, seeds_per_run au plus).
+# Une cle "seeds" dans config.json (autre que l'ancienne liste par defaut) remplace ce fichier.
+
+# --- Plateformes, medias, marques
+netflixfr             # Netflix France
+primevideofr          # Prime Video France
+canalplus             # Canal+
+tf1                   # TF1
+m6                    # M6
+franceinfo            # franceinfo
+bfmtv                 # BFMTV
+lemondefr             # Le Monde
+leparisien            # Le Parisien
+brutofficiel          # Brut
+hugodecrypte          # HugoDecrypte
+konbini               # Konbini
+lequipe               # L'Equipe
+rolandgarros          # Roland-Garros
+letour                # Tour de France
+
+# --- Sport
+psg                   # Paris Saint-Germain
+olympiquedemarseille  # Olympique de Marseille
+ol                    # Olympique Lyonnais
+equipedefrance        # Equipe de France de football
+k.mbappe              # Kylian Mbappe
+antogriezmann         # Antoine Griezmann
+karimbenzema          # Karim Benzema
+zidane                # Zinedine Zidane
+wemby                 # Victor Wembanyama
+teddyriner            # Teddy Riner
+
+# --- Stars, musique, humour, createurs
+squeezie              # Squeezie
+lenasituations        # Lena Situations
+tiboinshape           # Tibo InShape
+leaelui               # Lea Elui
+enjoyphoenix          # EnjoyPhoenix
+cyprien               # Cyprien
+normanfaitdesvideos   # Norman
+inoxtag               # Inoxtag
+amixem                # Amixem
+mcflyetcarlito        # McFly et Carlito
+booba                 # Booba
+gims                  # Gims
+ayanakamura_officiel  # Aya Nakamura
+angele_vl             # Angele
+jameldebbouze         # Jamel Debbouze
+gadelmaleh            # Gad Elmaleh
+kevadams              # Kev Adams
+nabilla               # Nabilla
+
+# --- Politique (bords differents)
+emmanuelmacron        # Emmanuel Macron
+gabrielattal          # Gabriel Attal
+edouardphilippe       # Edouard Philippe
+marine_lepen          # Marine Le Pen
+jordanbardella        # Jordan Bardella
+jlmelenchon           # Jean-Luc Melenchon
+francois_ruffin       # Francois Ruffin
+annehidalgo           # Anne Hidalgo
+laurentwauquiez       # Laurent Wauquiez
+marinetondelier       # Marine Tondelier
+fabienroussel         # Fabien Roussel

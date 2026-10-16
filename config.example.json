@@ -1,0 +1,8 @@
+{
+  "username": "",
+  "follows_per_day": 100,
+  "unfollow_after_days": 5,
+  "adaptive_delay": true,
+  "virtual_desktop": 2,
+  "browser_channel": "chrome"
+}
