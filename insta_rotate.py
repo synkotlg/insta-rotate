@@ -484,16 +484,18 @@ def launch(p, cfg, hidden):
 
 
 def place_on_bot_desktop(desktop_no):
-    """Windows : envoie la fenetre du navigateur sur le bureau virtuel dedie (cree si besoin)."""
+    """Windows : envoie la fenetre du navigateur sur le bureau virtuel dedie (cree si besoin).
+    Renvoie les identifiants des bureaux crees par cet appel, a passer a remove_desktops en fin de passage."""
+    created = []
     if os.name != "nt":
-        return False
+        return created
     try:
         import ctypes
         from ctypes import wintypes
         from pyvda import AppView, VirtualDesktop, get_virtual_desktops
     except Exception as e:
         log.warning("Bureau virtuel indisponible (%s) : la fenetre reste hors ecran", e)
-        return False
+        return created
 
     user32 = ctypes.windll.user32
     target = str(PROFILE.resolve()).lower()
@@ -532,14 +534,15 @@ def place_on_bot_desktop(desktop_no):
         time.sleep(0.5)
     if not hwnd:
         log.warning("Fenetre du navigateur introuvable : elle reste hors ecran")
-        return False
+        return created
     try:
         total = len(get_virtual_desktops())
         while total < desktop_no:
-            VirtualDesktop.create()
+            desktop = VirtualDesktop.create()
+            created.append(desktop.id)
             total += 1
             try:
-                VirtualDesktop(total).rename("Insta")
+                desktop.rename("Insta")
             except Exception:
                 pass
         for _ in range(5):
@@ -555,9 +558,37 @@ def place_on_bot_desktop(desktop_no):
                             0x0001 | 0x0004 | 0x0010)  # NOSIZE | NOZORDER | NOACTIVATE
     except Exception as e:
         log.warning("Placement sur le bureau %d impossible (%s) : fenetre hors ecran", desktop_no, e)
-        return False
+        return created
     log.info("Fenetre placee sur le bureau virtuel %d", desktop_no)
-    return True
+    return created
+
+
+def remove_desktops(ids):
+    """Supprime, une fois le navigateur ferme, les bureaux crees par place_on_bot_desktop pendant ce passage.
+    Un bureau ou il reste une fenetre (deplacee la par toi entre-temps) est garde."""
+    if not ids:
+        return
+    try:
+        from pyvda import VirtualDesktop
+    except Exception:
+        return
+    for desktop_id in ids:
+        try:
+            desktop = VirtualDesktop(desktop_id=desktop_id)
+        except Exception:
+            continue  # deja ferme entre-temps
+        try:
+            for _ in range(10):  # ~5 s pour que la fenetre du navigateur disparaisse
+                if not desktop.apps_by_z_order(include_pinned=False):
+                    break
+                time.sleep(0.5)
+            else:
+                log.info("Bureau virtuel garde : une fenetre y est encore ouverte")
+                continue
+            desktop.remove()
+            log.info("Bureau virtuel supprime")
+        except Exception as e:
+            log.warning("Suppression du bureau virtuel impossible (%s)", e)
 
 
 def dismiss_popups(page):
@@ -894,9 +925,10 @@ def cmd_check_seeds(cfg, here):
     ok, ko = [], []
     with sync_playwright() as p:
         ctx = launch(p, cfg, hidden=not here)
+        created = []
         try:
             if not here:
-                place_on_bot_desktop(cfg["virtual_desktop"])
+                created = place_on_bot_desktop(cfg["virtual_desktop"])
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             page.set_default_timeout(15000)
             if not logged_in(page):
@@ -917,6 +949,7 @@ def cmd_check_seeds(cfg, here):
                 ctx.close()
             except Exception:
                 pass
+            remove_desktops(created)
     log.info("Sources verifiees : %d valides, %d introuvables%s", len(ok), len(ko),
              " (" + ", ".join(ko) + ")" if ko else "")
     return 0
@@ -981,9 +1014,10 @@ def cmd_run(cfg, here, force=False):
     try:
         with sync_playwright() as p:
             ctx = launch(p, cfg, hidden=not here)
+            created = []
             try:
                 if not here:
-                    place_on_bot_desktop(cfg["virtual_desktop"])
+                    created = place_on_bot_desktop(cfg["virtual_desktop"])
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
                 page.set_default_timeout(15000)
                 if not logged_in(page):
@@ -1033,6 +1067,7 @@ def cmd_run(cfg, here, force=False):
                     ctx.close()
                 except Exception:
                     pass
+                remove_desktops(created)
     except Exception:
         log.exception("Erreur inattendue")
         return 1

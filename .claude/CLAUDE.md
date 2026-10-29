@@ -76,4 +76,7 @@ bureau virtuel dedie.
 - Les pseudos de seeds.txt ont ete ecrits de memoire : `check-seeds` avant la premiere vraie passe.
 - Le placement sur bureau virtuel passe par pyvda (API COM interne de Windows) : peut casser apres une mise a jour
   de Windows. Repli automatique : fenetre hors ecran sur le bureau courant.
+- Un bureau cree par un passage (run, check-seeds) est supprime a la fin de ce passage, navigateur ferme
+  (`remove_desktops`), sauf s'il y reste une fenetre. Un bureau deja present n'est jamais supprime : si tu as
+  deja `virtual_desktop` bureaux, la fenetre va sur le tien.
 - L'interface web d'Instagram change souvent : voir la skill maj-selecteurs.
