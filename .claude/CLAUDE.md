@@ -7,7 +7,9 @@ bureau virtuel dedie.
 
 ## Commandes
 - `.\setup.ps1` : venv, dependances, tache planifiee "InstaRotate" (options `-Time 09:00`, `-DailyOnly`, `-NoTask`, `-Remove`),
-  declenchee 5 min apres chaque ouverture de session et chaque jour
+  declenchee 5 min apres chaque ouverture de session et chaque jour, puis toutes les heures jusqu'a 23:00 (un passage
+  rate, hors plage ou plante reprend dans l'heure). La tache contient le chemin complet : relancer setup.ps1 apres
+  tout deplacement du dossier.
 - `.\.venv\Scripts\python.exe insta_rotate.py login` : connexion manuelle unique, session gardee dans data\profile
   (demande aussi ton pseudo et l'ecrit dans config.json ; leve aussi l'arret "intervention requise")
 - `... insta_rotate.py run` : passe quotidienne (`--here` : fenetre visible sur le bureau courant ; `--force` : ignore
