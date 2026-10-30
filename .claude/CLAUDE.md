@@ -47,7 +47,8 @@ bureau virtuel dedie.
 - Plafonds glissants cumules sur tous les passages : max_follows_per_hour, max_unfollows_per_hour ; plafonds du jour :
   max_unfollows_per_day ; max_following (plus d'abonnement si les desabonnements ne suivent pas). Les pauses sont
   calees sur 3600 / plafond (`human_pause`) ; `throttle()` attend ou arrete le passage.
-- Plage horaire `active_hours`, jour de repos (`rest_day_chance`, tire par date, jamais deux de suite).
+- Plage horaire `active_hours`, jour de repos (`rest_day_chance`, tire par date, seulement si la
+  veille a eu des abonnements ou desabonnements : une veille sans action, PC eteint compris, vaut deja repos).
 - Une seule source par passage, utilisee jusqu'au quota, en rotation dans l'ordre de seeds.txt (meta last_seed :
   le passage suivant part de la source d'apres). La source suivante n'est ouverte dans le meme passage que si
   celle-ci est epuisee ou inaccessible, `seeds_per_run` sources au plus.

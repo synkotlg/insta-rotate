@@ -252,6 +252,11 @@ class State:
     def unfollowed_today(self):
         return self.count("unfollowed_on=?", (today().isoformat(),))
 
+    def acted_on(self, day):
+        """Au moins un abonnement ou desabonnement ce jour-la."""
+        d = day.isoformat()
+        return self.count("followed_on=? OR unfollowed_on=?", (d, d)) > 0
+
     def active_follow_days(self):
         """Jours (avant aujourd'hui) ou des abonnements ont ete faits : sert a la montee en charge."""
         return self.db.execute("SELECT COUNT(DISTINCT followed_on) FROM users WHERE followed_on < ?",
@@ -366,11 +371,11 @@ def describe(stats):
 # ---------------------------------------------------------------------------
 # Prudence : montee en charge, plafonds horaires, plage horaire, repos, blocages
 # ---------------------------------------------------------------------------
-def is_rest_day(cfg, day):
-    """Jour de repos : tire une fois par date (stable d'un passage a l'autre), jamais deux jours de suite."""
-    def drawn(d):
-        return random.Random("repos-" + d.isoformat()).random() < cfg["rest_day_chance"]
-    return drawn(day) and not drawn(day - timedelta(days=1))
+def is_rest_day(cfg, st, day):
+    """Jour de repos : tire une fois par date (stable d'un passage a l'autre), seulement si la veille a eu des
+    abonnements ou desabonnements. Une veille sans action (repos, PC eteint, hors plage) vaut deja repos."""
+    drawn = random.Random("repos-" + day.isoformat()).random() < cfg["rest_day_chance"]
+    return drawn and st.acted_on(day - timedelta(days=1))
 
 
 def in_active_hours(cfg, moment):
@@ -1001,8 +1006,8 @@ def cmd_status(cfg):
     print(f"Pause anti-blocage jusqu'au                : {st.get_meta('blocked_until') or '-'}")
     telegram = os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID")
     print(f"Notifications Telegram                     : {'actives' if telegram else 'non configurees (.env)'}")
-    if is_rest_day(cfg, today()):
-        print("Aujourd'hui                                : jour de repos")
+    if is_rest_day(cfg, st, today()):
+        print("Aujourd'hui                                : jour de repos (aucune action, reprise demain)")
     if st.get_meta("needs_attention"):
         print(f"Intervention requise                       : {st.get_meta('needs_attention')}")
     return 0
@@ -1059,24 +1064,26 @@ def cmd_run(cfg, here, force=False):
         return 5
     until = st.get_meta("blocked_until")
     if until and now() < datetime.fromisoformat(until):
-        log.info("Pause anti-blocage jusqu'au %s : rien a faire", until)
+        log.info("Pause anti-blocage jusqu'au %s : aucune action d'ici la", until)
         return 0
     if not PROFILE.exists():
         log.error("Aucun profil navigateur : lance d'abord 'insta_rotate.py login'")
         send_alert(st, notify, "profile", "Échec : aucun profil navigateur, lance 'insta_rotate.py login'")
         return 2
-    if not force:
-        if not in_active_hours(cfg, now()):
-            log.info("Hors de la plage horaire %dh-%dh : rien a faire (--force pour passer outre)", *cfg["active_hours"])
-            return 0
-        if is_rest_day(cfg, today()):
-            log.info("Jour de repos : rien a faire")
-            return 0
+    if not force and not in_active_hours(cfg, now()):
+        log.info("Hors de la plage horaire %dh-%dh : aucune action avant %dh (--force pour passer outre)",
+                 *cfg["active_hours"], cfg["active_hours"][0])
+        return 0
     base = cfg["unfollow_after_days"]
     analysis = bool(cfg["adaptive_delay"] and cfg["username"])
+    days = int(st.get_meta("current_days") or base) if analysis else base
+    if not force and is_rest_day(cfg, st, today()):
+        log.info("Jour de repos tire au sort (la veille a eu des actions) : aucune action aujourd'hui, "
+                 "%d desabonnement(s) en attente, reprise demain (--force pour passer outre)",
+                 len(st.due(days, 10**6)))
+        return 0
     if cfg["adaptive_delay"] and not cfg["username"]:
         log.warning("Cle 'username' absente de config.json : pas de mesure des follow-back, delai fixe de %d jours", base)
-    days = int(st.get_meta("current_days") or base) if analysis else base
     budget = follow_budget(st, cfg)
     quota = max(0, budget - st.followed_today())
     if st.count("unfollowed_on IS NULL") >= cfg["max_following"]:
@@ -1095,7 +1102,7 @@ def cmd_run(cfg, here, force=False):
         return 1
     left = minutes_left(st, cfg)
     if left is not None and left < 5:
-        log.info("Temps de passage du jour deja utilise (%d min) : rien a faire", cfg["daily_minutes"])
+        log.info("Temps de passage du jour deja utilise (%d min) : aucune action avant demain", cfg["daily_minutes"])
         return 0
     cfg["_deadline"] = now() + timedelta(minutes=left) if left is not None else None
     started = now()
