@@ -28,6 +28,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import psutil
+from playwright.sync_api import Error as PWError
 from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
 
@@ -792,19 +793,27 @@ def scan_my_followers(page, me, st, cfg):
         return "skip", 0, 0
     cap = cfg["followback_scan_rows"]
     seen, stalls, scrolls = set(), 0, 0
-    while True:
-        before = len(seen)
-        seen.update(u for u in dlg.locator(ROW_LINK_SEL).evaluate_all(JS_HREF_USERS) if u)
-        if blocked(page):
-            shot(page, cfg, "blocked-scan")
-            return "blocked", len(seen), 0
-        if pending <= seen or len(seen) >= cap or scrolls >= 600:
-            break
-        stalls = stalls + 1 if scrolls and len(seen) == before else 0
-        if stalls >= 3:  # fin de liste
-            break
-        scroll_dialog(page, dlg)
-        scrolls += 1
+    try:
+        while True:
+            before = len(seen)
+            seen.update(u for u in dlg.locator(ROW_LINK_SEL).evaluate_all(JS_HREF_USERS) if u)
+            if blocked(page):
+                shot(page, cfg, "blocked-scan")
+                return "blocked", len(seen), 0
+            if pending <= seen or len(seen) >= cap or scrolls >= 600:
+                break
+            stalls = stalls + 1 if scrolls and len(seen) == before else 0
+            if stalls >= 3:  # fin de liste
+                break
+            scroll_dialog(page, dlg)
+            scrolls += 1
+    except PWError as e:  # la mesure ne doit pas empecher les desabonnements ; navigateur ferme : on arrete
+        if page.is_closed():
+            raise
+        log.warning("Lecture de tes abonnes interrompue apres %d lignes (%s) : mesure du jour ignoree",
+                    len(seen), str(e).splitlines()[0][:120])
+        shot(page, cfg, "scan-error")
+        return "skip", len(seen), 0
     found = pending & seen
     for user in found:
         st.mark_followed_back(user)

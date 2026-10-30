@@ -76,6 +76,9 @@ bureau virtuel dedie.
   retirer : sans lui, une fois le delai raccourci, les follow-back tardifs ne sont plus observes.
 - L'ordre de la liste d'abonnes n'est pas fiable (pas chronologique) : elle est lue en entier, plafonnee a
   `followback_scan_rows`.
+- Une erreur pendant cette lecture (liste disparue, delai depasse) ne fait pas echouer le passage : capture
+  `scan-error`, mesure du jour ignoree (relue au passage suivant), puis desabonnements et abonnements. Seul un
+  navigateur ferme arrete le passage.
 
 ## Regles
 - Pas d'emoji (code, logs, docs).
@@ -86,8 +89,6 @@ bureau virtuel dedie.
 - Un compte desabonne n'est jamais re-suivi (l'historique est conserve).
 - Ne pas augmenter quotas ni plafonds, ni raccourcir les pauses, sans demande explicite. Ne jamais desactiver l'arret
   sur reaction d'Instagram.
-- Pas de technique de camouflage de l'automatisation (fausses empreintes, proxys, masquage, trajectoires de souris
-  artificielles) : la prudence passe par le volume, le rythme et l'arret sur signal.
 
 ## Points d'attention
 - Les pseudos de seeds.txt ont ete ecrits de memoire : `check-seeds` avant la premiere vraie passe.
