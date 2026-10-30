@@ -24,6 +24,22 @@ bureau virtuel dedie.
 - config.json (ignore par git, contient ton pseudo) : surcharge des valeurs par defaut du dictionnaire DEFAULTS ;
   copie de config.example.json creee par setup.ps1, pseudo ajoute par `login`
 - data\ (ignore par git) : profil navigateur, state.db, log.txt, debug\*.png
+- telegram_notify.py : copie a l'identique de celui du projet github-follow-bot (dossier giithub), stdlib seule.
+  Ne pas le modifier ici : le corriger la-bas puis le recopier.
+- .env (ignore par git) : TELEGRAM_BOT_TOKEN et TELEGRAM_CHAT_ID, meme bot que github-follow-bot. Lu au demarrage
+  (`load_env_file`, les vraies variables d'environnement priment). Sans ces deux cles : aucune notification.
+
+## Notifications Telegram
+- Seulement pour `run`, et seulement pour un passage qui ouvre le navigateur (pas pour les relances horaires sans
+  travail : hors plage, repos, pause anti-blocage, rien a faire). Prefixe `[insta-rotate] ` (cle `notify_name`).
+- "Lancement" avant l'ouverture du navigateur, puis resume (`format_summary`) dans le `finally` de `cmd_run`, y compris
+  en cas d'erreur ou d'interruption : statut, abonnements / desabonnements du passage et du jour, temps de passage,
+  delai courant, follow-back, pseudos.
+- Alertes (`send_alert`, problemes a regler a la main : session expiree, intervention requise, desabonnements en
+  echec, erreur, profil ou sources absents) : une par jour au plus pour un meme probleme (meta last_alert), et pas
+  de "Lancement" tant qu'une alerte du jour est en cours ; un passage termine sans alerte, ou `login`, la leve.
+- Test : `.\.venv\Scripts\python.exe telegram_notify.py "test" --prefix "[insta-rotate] "` (lit .env du dossier
+  courant). Un envoi rate n'interrompt jamais le passage (avertissement dans log.txt) ; le token n'est jamais logge.
 
 ## Prudence (anti-limitation)
 - Montee en charge : `follow_budget()` = min(follows_per_day, ramp_start + ramp_step x jours d'abonnements precedents)
@@ -64,7 +80,7 @@ bureau virtuel dedie.
 - Pas d'emoji (code, logs, docs).
 - Tout ce qui depend de l'interface Instagram (regex FR + EN, selecteurs, JS_USERS, JS_HREF_USERS) reste dans le bloc
   "UI" en haut du script.
-- Aucun mot de passe nulle part : la session vient du profil persistant.
+- Aucun mot de passe nulle part : la session vient du profil persistant. Le token Telegram reste dans .env.
 - Le script ne se desabonne que des comptes enregistres dans state.db, jamais des abonnements faits a la main.
 - Un compte desabonne n'est jamais re-suivi (l'historique est conserve).
 - Ne pas augmenter quotas ni plafonds, ni raccourcir les pauses, sans demande explicite. Ne jamais desactiver l'arret

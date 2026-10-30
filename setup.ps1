@@ -60,3 +60,7 @@ if (-not $NoTask) {
 Write-Host ""
 Write-Host "Etape suivante (une seule fois) : connexion a Instagram"
 Write-Host "  .\.venv\Scripts\python.exe insta_rotate.py login"
+if (-not (Test-Path ".env")) {
+    Write-Host ""
+    Write-Host "Notifications Telegram (optionnel) : TELEGRAM_BOT_TOKEN=... et TELEGRAM_CHAT_ID=... dans .env"
+}

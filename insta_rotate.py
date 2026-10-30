@@ -10,6 +10,8 @@ Le navigateur utilise un profil persistant : connexion manuelle une seule fois.
   python insta_rotate.py run       passe quotidienne (--here : rester sur le bureau courant)
   python insta_rotate.py status    etat de la rotation
   python insta_rotate.py check-seeds   verifie que les comptes sources existent
+
+Notifications Telegram (optionnel) : TELEGRAM_BOT_TOKEN et TELEGRAM_CHAT_ID dans .env (voir telegram_notify.py).
 """
 import argparse
 import atexit
@@ -29,7 +31,10 @@ import psutil
 from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
 
+from telegram_notify import TelegramNotifier, load_env_file
+
 ROOT = Path(__file__).resolve().parent
+ENV_FILE = ROOT / ".env"
 DATA = ROOT / "data"
 PROFILE = DATA / "profile"
 DB_PATH = DATA / "state.db"
@@ -135,6 +140,8 @@ DEFAULTS = {
     "locale": "fr-FR",
     "timezone": "Europe/Paris",
     "debug_screenshots": True,
+    # prefixe des messages Telegram (le meme bot sert a plusieurs projets)
+    "notify_name": "insta-rotate",
 }
 
 LEGACY_SEEDS = ["squeezie", "lenasituations", "booba", "k.mbappe"]  # ancienne liste par defaut de config.json
@@ -179,6 +186,9 @@ def setup_log():
         sh = logging.StreamHandler(sys.stdout)
         sh.setFormatter(fmt)
         logger.addHandler(sh)
+    tg = logging.getLogger("telegram_notify")  # echecs d'envoi Telegram dans le meme log
+    for h in logger.handlers:
+        tg.addHandler(h)
     return logger
 
 
@@ -251,6 +261,13 @@ class State:
         """Horodatages (ISO) des abonnements ('follow') ou desabonnements ('unfollow') depuis `since`."""
         col = "followed_at" if kind == "follow" else "unfollowed_at"
         rows = self.db.execute(f"SELECT {col} FROM users WHERE {col} >= ?",
+                               (since.isoformat(timespec="seconds"),)).fetchall()
+        return [r[0] for r in rows]
+
+    def users_since(self, kind, since):
+        """Pseudos suivis ('follow') ou desabonnes ('unfollow') depuis `since`, dans l'ordre."""
+        col = "followed_at" if kind == "follow" else "unfollowed_at"
+        rows = self.db.execute(f"SELECT username FROM users WHERE {col} >= ? ORDER BY {col}",
                                (since.isoformat(timespec="seconds"),)).fetchall()
         return [r[0] for r in rows]
 
@@ -861,6 +878,77 @@ def unfollow_pass(page, st, cfg, counter, days):
 
 
 # ---------------------------------------------------------------------------
+# Notifications Telegram : "Lancement" puis resume de fin pour chaque passage qui ouvre le navigateur
+# ---------------------------------------------------------------------------
+def make_notify(cfg):
+    """Fonction d'envoi (texte -> bool), qui ne fait rien si Telegram n'est pas configure (.env)."""
+    notifier = TelegramNotifier.from_env(prefix=f"[{cfg['notify_name']}] ")
+    return notifier.send if notifier else (lambda text: False)
+
+
+def send_alert(st, notify, code, text):
+    """Probleme a regler a la main : un message par jour au plus pour un meme probleme (la tache relance le
+    passage toutes les heures). meta last_alert = "<date> <code>", vide quand un passage se termine sans alerte."""
+    key = f"{today().isoformat()} {code}"
+    if st.get_meta("last_alert") != key and notify(text):
+        st.set_meta("last_alert", key)
+
+
+def format_duration(seconds):
+    minutes, secs = divmod(int(round(seconds)), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours} h {minutes:02d} min"
+    return f"{minutes} min {secs:02d} s" if minutes else f"{secs} s"
+
+
+def run_outcome(status, kind, pause, error):
+    """(statut lisible, code d'alerte ou None) d'un passage termine."""
+    if error:
+        return f"échec, {error}", "error"
+    if status == "session":
+        return "session Instagram absente ou expirée, relance 'insta_rotate.py login'", "session"
+    if status == "broken":
+        return ("3 désabonnements ratés de suite, interface d'Instagram modifiée ? "
+                "(data/debug, skill maj-selecteurs)"), "broken"
+    if status == "blocked" and kind == "attention":
+        return ("ARRÊT TOTAL : Instagram demande une intervention (vérification d'identité, suspension ou "
+                "déconnexion). Règle-le à la main, puis lance 'insta_rotate.py login'"), "attention"
+    if status == "blocked":
+        hours, factor = pause
+        return f"réaction d'Instagram ({kind}), pause de {hours} h, quotas ramenés à {factor * 100:.0f} %", None
+    if status == "stop":
+        return "arrêté avant la fin (plafond horaire, plage horaire ou temps du jour), reprise au prochain passage", None
+    return "OK", None
+
+
+def format_summary(st, cfg, started, outcome, days, budget):
+    """Message de fin de passage (francais, lu sur le telephone)."""
+    followed = st.users_since("follow", started)
+    unfollowed = st.users_since("unfollow", started)
+    used = float(st.get_meta(f"run_seconds:{today().isoformat()}") or 0) / 60
+    lines = [
+        f"Fin du passage en {format_duration((now() - started).total_seconds())} : {outcome}",
+        f"Ce passage : {len(followed)} abonnements, {len(unfollowed)} désabonnements",
+        f"Aujourd'hui : {st.followed_today()}/{budget} abonnements, {st.unfollowed_today()} désabonnements, "
+        f"{used:.0f} min de passage" + (f" sur {cfg['daily_minutes']}" if cfg["daily_minutes"] else ""),
+        f"Comptes suivis par le script : {st.count('unfollowed_on IS NULL')}, désabonnement après {days} j",
+    ]
+    if cfg["adaptive_delay"] and cfg["username"]:
+        stats = followback_stats(st.samples(cfg["adapt_window_days"]), cfg, cfg["unfollow_after_days"])
+        if stats["rate"] is None:
+            lines.append(f"Follow-back : {stats['events']} mesuré(s), pas encore assez de données")
+        else:
+            lines.append(f"Follow-back : {stats['rate'] * 100:.1f} % sous {stats['horizon']} j, "
+                         f"médian {stats['median']} j ({stats['events']} mesures)")
+    if followed:
+        lines.append("Nouveaux abonnements : " + ", ".join(followed))
+    if unfollowed:
+        lines.append("Désabonnements : " + ", ".join(unfollowed))
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Commandes
 # ---------------------------------------------------------------------------
 def save_config_key(key, value):
@@ -881,7 +969,9 @@ def cmd_login(cfg):
         ok = logged_in(page)
         log.info("Session %s", "enregistree" if ok else "NON detectee : relance la commande login")
         if ok:
-            State(DB_PATH).set_meta("needs_attention", "")
+            st = State(DB_PATH)
+            st.set_meta("needs_attention", "")
+            st.set_meta("last_alert", "")  # le prochain passage annonce de nouveau son lancement
             if not cfg["username"]:
                 name = input("Ton pseudo Instagram (sert a mesurer les follow-back) : ").strip().lstrip("@").lower()
                 if name:
@@ -909,6 +999,8 @@ def cmd_status(cfg):
     print(f"Follow-back                                : {describe(stats)}")
     print(f"Sources                                    : {len(cfg['seeds'])} comptes ({cfg['seeds_source']})")
     print(f"Pause anti-blocage jusqu'au                : {st.get_meta('blocked_until') or '-'}")
+    telegram = os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID")
+    print(f"Notifications Telegram                     : {'actives' if telegram else 'non configurees (.env)'}")
     if is_rest_day(cfg, today()):
         print("Aujourd'hui                                : jour de repos")
     if st.get_meta("needs_attention"):
@@ -957,10 +1049,13 @@ def cmd_check_seeds(cfg, here):
 
 def cmd_run(cfg, here, force=False):
     st = State(DB_PATH)
+    notify = make_notify(cfg)
     attention = st.get_meta("needs_attention")
     if attention:
         log.error("Intervention requise (%s) : regle le probleme a la main dans Instagram, "
                   "puis lance 'insta_rotate.py login'", attention)
+        send_alert(st, notify, "attention", f"Toujours à l'arrêt : intervention requise ({attention}). "
+                   "Règle le problème dans Instagram, puis lance 'insta_rotate.py login'")
         return 5
     until = st.get_meta("blocked_until")
     if until and now() < datetime.fromisoformat(until):
@@ -968,6 +1063,7 @@ def cmd_run(cfg, here, force=False):
         return 0
     if not PROFILE.exists():
         log.error("Aucun profil navigateur : lance d'abord 'insta_rotate.py login'")
+        send_alert(st, notify, "profile", "Échec : aucun profil navigateur, lance 'insta_rotate.py login'")
         return 2
     if not force:
         if not in_active_hours(cfg, now()):
@@ -994,6 +1090,8 @@ def cmd_run(cfg, here, force=False):
     alive = [seed for seed in cfg["seeds"] if int(st.get_meta(f"seed_fail:{seed}") or 0) < 3]
     if quota and not alive:
         log.error("Aucune source valide : verifie seeds.txt ou lance 'insta_rotate.py check-seeds'")
+        send_alert(st, notify, "seeds",
+                   "Échec : aucune source valide, vérifie seeds.txt ou lance 'insta_rotate.py check-seeds'")
         return 1
     left = minutes_left(st, cfg)
     if left is not None and left < 5:
@@ -1008,7 +1106,13 @@ def cmd_run(cfg, here, force=False):
 
     counter = [0]
     unfollows = follows = 0
-    status, kind = "ok", None
+    status, kind, pause = "ok", None, None
+    error = "interrompu"  # remplace quand le passage va au bout ou leve une erreur
+    # deja une alerte aujourd'hui : pas de "Lancement" a chaque relance horaire tant que le probleme dure
+    if not (st.get_meta("last_alert") or "").startswith(today().isoformat()):
+        avail = f"{left:.0f} min disponibles" if left is not None else "sans limite de temps"
+        notify(f"Lancement : {quota} abonnements possibles, {len(st.due(days, room))} désabonnements "
+               f"en attente, {avail}")
     if cfg["keep_awake"]:
         keep_awake(True)
     try:
@@ -1022,6 +1126,7 @@ def cmd_run(cfg, here, force=False):
                 page.set_default_timeout(15000)
                 if not logged_in(page):
                     log.error("Session Instagram absente ou expiree : relance 'insta_rotate.py login'")
+                    status, error = "session", None
                     return 3
                 if analysis:
                     if st.get_meta("last_scan_on") != today().isoformat():  # une lecture par jour
@@ -1068,24 +1173,37 @@ def cmd_run(cfg, here, force=False):
                 except Exception:
                     pass
                 remove_desktops(created)
-    except Exception:
+
+        if status == "blocked" and kind == "attention":
+            st.set_meta("needs_attention", f"{now():%Y-%m-%d %H:%M} verification, suspension ou deconnexion")
+            log.error("Instagram demande une intervention (verification d'identite, suspension ou deconnexion) : "
+                      "arret total. Regle-le a la main, puis lance 'insta_rotate.py login'")
+        elif status == "blocked":
+            pause = register_block(st, cfg, kind)
+            log.warning("Reaction d'Instagram (%s) : pause de %d h, quotas ramenes a %d %%",
+                        kind, pause[0], pause[1] * 100)
+        else:
+            register_clean_day(st)
+        log.info("Termine : %d abonnement(s), %d desabonnement(s)", follows, unfollows)
+        error = None
+        return 0
+    except Exception as e:
         log.exception("Erreur inattendue")
+        error = f"{type(e).__name__}: {(str(e).splitlines() or [''])[0][:200]}"
         return 1
     finally:
         add_run_time(st, started)
         keep_awake(False)
-
-    if status == "blocked" and kind == "attention":
-        st.set_meta("needs_attention", f"{now():%Y-%m-%d %H:%M} verification, suspension ou deconnexion")
-        log.error("Instagram demande une intervention (verification d'identite, suspension ou deconnexion) : "
-                  "arret total. Regle-le a la main, puis lance 'insta_rotate.py login'")
-    elif status == "blocked":
-        hours, factor = register_block(st, cfg, kind)
-        log.warning("Reaction d'Instagram (%s) : pause de %d h, quotas ramenes a %d %%", kind, hours, factor * 100)
-    else:
-        register_clean_day(st)
-    log.info("Termine : %d abonnement(s), %d desabonnement(s)", follows, unfollows)
-    return 0
+        try:  # fin du passage annoncee dans tous les cas, sans jamais faire echouer le passage
+            outcome, code = run_outcome(status, kind, pause, error)
+            text = format_summary(st, cfg, started, outcome, days, budget)
+            if code:
+                send_alert(st, notify, code, text)
+            else:
+                st.set_meta("last_alert", "")
+                notify(text)
+        except Exception as e:
+            log.warning("Resume Telegram non envoye (%s)", e)
 
 
 def main():
@@ -1096,6 +1214,7 @@ def main():
     ap.add_argument("--force", action="store_true",
                     help="run : ignorer la plage horaire et le jour de repos (debug)")
     args = ap.parse_args()
+    load_env_file(ENV_FILE)  # TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID ; les vraies variables d'environnement priment
     cfg = load_config()
     if args.cmd == "status":
         return cmd_status(cfg)
