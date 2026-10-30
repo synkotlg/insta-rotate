@@ -47,6 +47,8 @@ SHOTS = DATA / "debug"
 # ---------------------------------------------------------------------------
 IG = "https://www.instagram.com"
 FOLLOW_RE = re.compile(r"^(Suivre|Follow)$", re.I)
+# Profil d'un compte qu'on ne suit pas (ou plus) : "Suivre", ou "Suivre en retour" s'il te suit
+NOT_FOLLOWING_RE = re.compile(r"^(Suivre|Follow)( en retour| back)?$", re.I)
 FOLLOWING_RE = re.compile(
     r"^(Abonné\(e\)|Abonné|Suivi(\(e\)|e)?|Following|Demande envoyée|Demandé|Requested)", re.I)
 UNFOLLOW_RE = re.compile(
@@ -837,7 +839,7 @@ def unfollow_one(page, user, cfg):
     if page.get_by_text(NOT_FOUND_RE).first.is_visible():
         return "gone"
     header = page.locator("header").first
-    if header.get_by_role("button", name=FOLLOW_RE).count() > 0:
+    if header.get_by_role("button", name=NOT_FOLLOWING_RE).count() > 0:
         return "ok"  # deja plus abonne
     btn = header.get_by_role("button", name=FOLLOWING_RE).first
     if btn.count() == 0:
@@ -857,7 +859,7 @@ def unfollow_one(page, user, cfg):
     if blocked(page):
         return "blocked"
     try:
-        header.get_by_role("button", name=FOLLOW_RE).first.wait_for(state="visible", timeout=5000)
+        header.get_by_role("button", name=NOT_FOLLOWING_RE).first.wait_for(state="visible", timeout=5000)
         return "ok"
     except PWTimeout:
         shot(page, cfg, f"unfollow-{user}")
