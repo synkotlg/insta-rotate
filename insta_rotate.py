@@ -22,6 +22,7 @@ import random
 import re
 import sqlite3
 import sys
+import threading
 import time
 from datetime import date, datetime, timedelta
 from logging.handlers import RotatingFileHandler
@@ -41,6 +42,7 @@ PROFILE = DATA / "profile"
 DB_PATH = DATA / "state.db"
 LOCK = DATA / "run.lock"
 SHOTS = DATA / "debug"
+MAX_UNFOLLOW_FAILS = 3  # echecs de desabonnement d'un meme compte (tous passages confondus) avant abandon
 
 # ---------------------------------------------------------------------------
 # UI : tout ce qui depend du texte ou du DOM d'Instagram (FR + EN) est ici.
@@ -124,6 +126,8 @@ DEFAULTS = {
     "active_hours": [8, 23],
     "daily_minutes": 180,
     "keep_awake": True,
+    # demarrage (navigateur, bureau virtuel, connexion) plus long : alerte et arret du passage
+    "startup_minutes": 8,
     "rest_day_chance": 0.15,
     "block_cooldown_hours": 48,
     "warning_cooldown_hours": 168,
@@ -220,11 +224,13 @@ class State:
         self.db.executescript(
             "CREATE TABLE IF NOT EXISTS users ("
             " username TEXT PRIMARY KEY, followed_on TEXT NOT NULL, followed_at TEXT NOT NULL,"
-            " unfollowed_on TEXT, note TEXT, followed_back_on TEXT, fixed_days INTEGER, unfollowed_at TEXT);"
+            " unfollowed_on TEXT, note TEXT, followed_back_on TEXT, fixed_days INTEGER, unfollowed_at TEXT,"
+            " unfollow_fails INTEGER);"
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);"
         )
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(users)")}
-        for col, ddl in (("followed_back_on", "TEXT"), ("fixed_days", "INTEGER"), ("unfollowed_at", "TEXT")):
+        for col, ddl in (("followed_back_on", "TEXT"), ("fixed_days", "INTEGER"), ("unfollowed_at", "TEXT"),
+                         ("unfollow_fails", "INTEGER")):
             if col not in cols:  # base creee par la premiere version du script
                 self.db.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
         self.db.commit()
@@ -239,10 +245,25 @@ class State:
             (user, today().isoformat(), now().isoformat(timespec="seconds"), fixed_days))
         self.db.commit()
 
-    def mark_unfollowed(self, user, note=None):
+    def mark_unfollowed(self, user, note=None, acted=True):
+        """acted=False : rien a faire sur Instagram (deja plus suivi, compte introuvable). Sans unfollowed_at,
+        le compte ne compte ni dans les plafonds horaire et journalier, ni dans le resume du passage."""
         self.db.execute("UPDATE users SET unfollowed_on=?, unfollowed_at=?, note=? WHERE username=?",
-                        (today().isoformat(), now().isoformat(timespec="seconds"), note, user))
+                        (today().isoformat(), now().isoformat(timespec="seconds") if acted else None, note, user))
         self.db.commit()
+
+    def add_unfollow_fail(self, user):
+        """Echec de desabonnement : le compte passe en fin de file (voir due). Retourne le nombre d'echecs."""
+        self.db.execute("UPDATE users SET unfollow_fails = COALESCE(unfollow_fails, 0) + 1 WHERE username=?",
+                        (user,))
+        self.db.commit()
+        return self.db.execute("SELECT unfollow_fails FROM users WHERE username=?", (user,)).fetchone()[0]
+
+    def given_up(self):
+        """Comptes toujours suivis dont le desabonnement a echoue MAX_UNFOLLOW_FAILS fois : a faire a la main."""
+        rows = self.db.execute("SELECT username FROM users WHERE unfollowed_on IS NULL AND unfollow_fails >= ? "
+                               "ORDER BY followed_on, username", (MAX_UNFOLLOW_FAILS,)).fetchall()
+        return [r[0] for r in rows]
 
     def mark_followed_back(self, user):
         self.db.execute("UPDATE users SET followed_back_on=? WHERE username=? AND followed_back_on IS NULL",
@@ -253,7 +274,7 @@ class State:
         return self.count("followed_on=?", (today().isoformat(),))
 
     def unfollowed_today(self):
-        return self.count("unfollowed_on=?", (today().isoformat(),))
+        return self.count("unfollowed_on=? AND unfollowed_at IS NOT NULL", (today().isoformat(),))
 
     def acted_on(self, day):
         """Au moins un abonnement ou desabonnement ce jour-la."""
@@ -280,11 +301,14 @@ class State:
         return [r[0] for r in rows]
 
     def due(self, days, limit):
-        """Comptes a desabonner : age >= delai propre au compte, sinon `days` (delai courant)."""
+        """Comptes a desabonner : age >= delai propre au compte, sinon `days` (delai courant). Les comptes deja
+        en echec passent apres les autres (sinon trois echecs en tete de file bloquent chaque passage), ceux
+        qui ont echoue MAX_UNFOLLOW_FAILS fois sont abandonnes (given_up)."""
         rows = self.db.execute(
-            "SELECT username FROM users WHERE unfollowed_on IS NULL "
+            "SELECT username FROM users WHERE unfollowed_on IS NULL AND COALESCE(unfollow_fails, 0) < ? "
             "AND date(followed_on, '+' || COALESCE(fixed_days, ?) || ' days') <= ? "
-            "ORDER BY followed_on, username LIMIT ?", (days, today().isoformat(), limit)).fetchall()
+            "ORDER BY COALESCE(unfollow_fails, 0), followed_on, username LIMIT ?",
+            (MAX_UNFOLLOW_FAILS, days, today().isoformat(), limit)).fetchall()
         return [r[0] for r in rows]
 
     def pending(self):
@@ -468,13 +492,15 @@ def throttle(page, st, cfg, kind):
 
 
 def acquire_lock():
+    """Une seule instance. Un verrou laisse par un passage tue (PC eteint, plantage) est ignore : Windows
+    reutilise les numeros de processus, on verifie donc que celui du verrou est bien insta_rotate.py."""
     DATA.mkdir(parents=True, exist_ok=True)
     if LOCK.exists():
         try:
             pid = int(LOCK.read_text().strip())
-            if pid != os.getpid() and psutil.pid_exists(pid):
+            if pid != os.getpid() and "insta_rotate" in " ".join(psutil.Process(pid).cmdline()).lower():
                 return False
-        except ValueError:
+        except (ValueError, psutil.Error):
             pass
     LOCK.write_text(str(os.getpid()))
     atexit.register(lambda: LOCK.unlink(missing_ok=True))
@@ -501,11 +527,26 @@ def launch(p, cfg, hidden):
     try:
         return p.chromium.launch_persistent_context(channel=channel, **kw)
     except Exception as e:
-        if not channel:
+        # repli seulement si le navigateur manque : un demarrage trop lent (PC sature) ne va pas mieux avec un
+        # autre navigateur sur le meme profil
+        if not channel or "Timeout" in str(e):
             raise
         log.warning("Navigateur '%s' indisponible (%s), essai avec le Chromium de Playwright",
                     channel, str(e).splitlines()[0][:120])
         return p.chromium.launch_persistent_context(**kw)
+
+
+def profile_pids():
+    """Processus du navigateur lances sur data\\profile."""
+    target = str(PROFILE.resolve()).lower()
+    pids = set()
+    for pr in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            if target in " ".join(pr.info["cmdline"] or []).lower():
+                pids.add(pr.info["pid"])
+        except psutil.Error:
+            continue
+    return pids
 
 
 def place_on_bot_desktop(desktop_no):
@@ -523,17 +564,10 @@ def place_on_bot_desktop(desktop_no):
         return created
 
     user32 = ctypes.windll.user32
-    target = str(PROFILE.resolve()).lower()
     enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
 
     def find_hwnd():
-        pids = set()
-        for pr in psutil.process_iter(["pid", "cmdline"]):
-            try:
-                if target in " ".join(pr.info["cmdline"] or []).lower():
-                    pids.add(pr.info["pid"])
-            except psutil.Error:
-                continue
+        pids = profile_pids()
         best = [None, 0]
 
         def cb(hwnd, _):
@@ -658,7 +692,14 @@ def shot(page, cfg, name):
 
 
 def logged_in(page):
-    page.goto(IG + "/", wait_until="domcontentloaded")
+    for attempt in range(2):  # Instagram lent juste apres le demarrage : un second essai
+        try:
+            page.goto(IG + "/", wait_until="domcontentloaded")
+            break
+        except PWTimeout:
+            if attempt:
+                raise
+            page.wait_for_timeout(5000)
     try:
         page.wait_for_selector(f"{LOGGED_IN_SEL}, {LOGIN_FORM_SEL}", timeout=20000)
     except PWTimeout:
@@ -712,52 +753,59 @@ def scroll_dialog(page, dlg):
 
 def follow_from_seed(page, seed, quota, st, cfg, counter, fixed_days=lambda: None):
     """Suit jusqu'a `quota` abonnes de `seed`. Retourne (nombre, 'ok' | 'skip' | 'stop' | 'blocked')."""
-    dlg = open_followers(page, seed)
+    try:
+        dlg = open_followers(page, seed)
+    except PWTimeout:  # profil de la source trop lent a charger
+        dlg = None
     if dlg is None:
         log.info("[%s] liste d'abonnes inaccessible, source ignoree", seed)
         shot(page, cfg, f"followers-{seed}")
         return 0, "skip"
     done = fails = scrolls = stalls = 0
     skip = set()
-    while done < quota and scrolls <= cfg["max_scrolls_per_seed"]:
-        btns = dlg.get_by_role("button", name=FOLLOW_RE)
-        users = btns.evaluate_all(JS_USERS)
-        idx = next((i for i, u in enumerate(users) if u and u not in skip and not st.known(u)), None)
-        if idx is None:  # rien d'eligible a l'ecran : on descend dans la liste
-            before = dlg.locator(ROW_LINK_SEL).count()
-            scroll_dialog(page, dlg)
-            scrolls += 1
-            stalls = stalls + 1 if dlg.locator(ROW_LINK_SEL).count() == before else 0
-            if stalls >= 3:  # fin de liste
-                break
-            continue
-        user = users[idx]
-        if not throttle(page, st, cfg, "follow"):
-            return done, "stop"
-        try:
-            btns.nth(idx).click(timeout=8000)
-        except PWTimeout:
-            skip.add(user)
-            continue
-        page.wait_for_timeout(rnd(1500, 2500))
-        if blocked(page):
-            shot(page, cfg, "blocked-follow")
-            return done, "blocked"
-        if not follow_registered(page, dlg, user):
-            # le bouton est reste ou revenu sur "Suivre" : Instagram a ignore le clic (limitation silencieuse)
-            fails += 1
-            skip.add(user)
-            log.info("[%s] abonnement a @%s non pris en compte (%d de suite)", seed, user, fails)
-            shot(page, cfg, f"follow-{user}")
-            if fails >= 3:
+    try:
+        while done < quota and scrolls <= cfg["max_scrolls_per_seed"]:
+            btns = dlg.get_by_role("button", name=FOLLOW_RE)
+            users = btns.evaluate_all(JS_USERS)
+            idx = next((i for i, u in enumerate(users) if u and u not in skip and not st.known(u)), None)
+            if idx is None:  # rien d'eligible a l'ecran : on descend dans la liste
+                before = dlg.locator(ROW_LINK_SEL).count()
+                scroll_dialog(page, dlg)
+                scrolls += 1
+                stalls = stalls + 1 if dlg.locator(ROW_LINK_SEL).count() == before else 0
+                if stalls >= 3:  # fin de liste
+                    break
+                continue
+            user = users[idx]
+            if not throttle(page, st, cfg, "follow"):
+                return done, "stop"
+            try:
+                btns.nth(idx).click(timeout=8000)
+            except PWTimeout:
+                skip.add(user)
+                continue
+            page.wait_for_timeout(rnd(1500, 2500))
+            if blocked(page):
+                shot(page, cfg, "blocked-follow")
                 return done, "blocked"
-            continue
-        fails = 0
-        st.add_follow(user, fixed_days())
-        done += 1
-        counter[0] += 1
-        log.info("[%s] abonne a @%s (%d/%d)", seed, user, done, quota)
-        human_pause(page, cfg, counter[0], "follow")
+            if not follow_registered(page, dlg, user):
+                # le bouton est reste ou revenu sur "Suivre" : Instagram a ignore le clic (limitation silencieuse)
+                fails += 1
+                skip.add(user)
+                log.info("[%s] abonnement a @%s non pris en compte (%d de suite)", seed, user, fails)
+                shot(page, cfg, f"follow-{user}")
+                if fails >= 3:
+                    return done, "blocked"
+                continue
+            fails = 0
+            st.add_follow(user, fixed_days())
+            done += 1
+            counter[0] += 1
+            log.info("[%s] abonne a @%s (%d/%d)", seed, user, done, quota)
+            human_pause(page, cfg, counter[0], "follow")
+    except PWTimeout as e:  # liste disparue ou page figee : on passe a la source suivante
+        log.warning("[%s] liste d'abonnes interrompue (%s)", seed, str(e).splitlines()[0][:120])
+        shot(page, cfg, f"followers-{seed}-error")
     return done, "ok"
 
 
@@ -788,14 +836,14 @@ def scan_my_followers(page, me, st, cfg):
     pending = st.pending()
     if not pending:
         return "ok", 0, 0
-    dlg = open_followers(page, me)
-    if dlg is None:
-        log.warning("Liste de tes abonnes inaccessible (pseudo '%s' correct ?) : mesure du jour ignoree", me)
-        shot(page, cfg, "scan-followers")
-        return "skip", 0, 0
     cap = cfg["followback_scan_rows"]
     seen, stalls, scrolls = set(), 0, 0
     try:
+        dlg = open_followers(page, me)
+        if dlg is None:
+            log.warning("Liste de tes abonnes inaccessible (pseudo '%s' correct ?) : mesure du jour ignoree", me)
+            shot(page, cfg, "scan-followers")
+            return "skip", 0, 0
         while True:
             before = len(seen)
             seen.update(u for u in dlg.locator(ROW_LINK_SEL).evaluate_all(JS_HREF_USERS) if u)
@@ -830,7 +878,8 @@ def scan_my_followers(page, me, st, cfg):
 # Desabonnements
 # ---------------------------------------------------------------------------
 def unfollow_one(page, user, cfg):
-    """Retourne 'ok' | 'gone' | 'failed' | 'blocked'."""
+    """Retourne 'ok' | 'already' (deja plus suivi) | 'gone' | 'noload' (page vide) | 'failed' | 'blocked'.
+    Leve PWTimeout si la page ne charge pas (traite comme 'noload' par unfollow_pass)."""
     page.goto(f"{IG}/{user}/", wait_until="domcontentloaded")
     page.wait_for_timeout(rnd(2500, 4000))
     dismiss_popups(page)
@@ -839,8 +888,11 @@ def unfollow_one(page, user, cfg):
     if page.get_by_text(NOT_FOUND_RE).first.is_visible():
         return "gone"
     header = page.locator("header").first
+    if header.count() == 0:  # page blanche ou incomplete : connexion coupee ou Instagram lent, pas l'interface
+        shot(page, cfg, f"unfollow-{user}-noload")
+        return "noload"
     if header.get_by_role("button", name=NOT_FOLLOWING_RE).count() > 0:
-        return "ok"  # deja plus abonne
+        return "already"
     btn = header.get_by_role("button", name=FOLLOWING_RE).first
     if btn.count() == 0:
         shot(page, cfg, f"unfollow-{user}-nobutton")
@@ -867,29 +919,48 @@ def unfollow_one(page, user, cfg):
 
 
 def unfollow_pass(page, st, cfg, counter, days):
-    """Retourne (nombre, 'ok' | 'stop' | 'blocked' | 'broken')."""
+    """Retourne (nombre, 'ok' | 'stop' | 'slow' | 'blocked' | 'broken').
+    Un compte en echec passe en fin de file (abandonne apres MAX_UNFOLLOW_FAILS echecs). Trois echecs
+    d'interface de suite arretent le passage ('broken'), trois pages non chargees de suite aussi ('slow')."""
     due = st.due(days, max(0, cfg["max_unfollows_per_day"] - st.unfollowed_today()))
     log.info("%d compte(s) a desabonner", len(due))
-    done = fails = 0
+    done = fails = noload = 0
+    notes = {"ok": None, "already": "deja plus suivi", "gone": "introuvable"}
     for user in due:
         if not throttle(page, st, cfg, "unfollow"):
             return done, "stop"
-        res = unfollow_one(page, user, cfg)
+        try:
+            res = unfollow_one(page, user, cfg)
+        except PWTimeout:  # page trop lente : echec pour ce compte, pas pour tout le passage
+            shot(page, cfg, f"unfollow-{user}-timeout")
+            res = "noload"
         if res == "blocked":
             return done, "blocked"
-        if res in ("ok", "gone"):
-            st.mark_unfollowed(user, None if res == "ok" else "introuvable")
-            done += 1
-            fails = 0
-            counter[0] += 1
-            log.info("desabonne de @%s%s", user, "" if res == "ok" else " (compte introuvable)")
-            human_pause(page, cfg, counter[0], "unfollow")
-        else:
-            fails += 1
-            log.warning("echec du desabonnement de @%s (%d de suite)", user, fails)
-            if fails >= 3:
-                log.warning("3 echecs de suite : interface modifiee ? voir data/debug et la skill maj-selecteurs")
-                return done, "broken"
+        if res in notes:
+            st.mark_unfollowed(user, notes[res], acted=res == "ok")
+            fails = noload = 0
+            log.info("desabonne de @%s%s", user, f" ({notes[res]})" if notes[res] else "")
+            if res == "ok":
+                done += 1
+                counter[0] += 1
+                human_pause(page, cfg, counter[0], "unfollow")
+            else:  # aucun clic : pas de pause longue, juste le temps de quitter la page
+                page.wait_for_timeout(rnd(3000, 8000))
+            continue
+        if st.add_unfollow_fail(user) >= MAX_UNFOLLOW_FAILS:
+            log.warning("desabonnement de @%s abandonne apres %d echecs : a faire a la main", user, MAX_UNFOLLOW_FAILS)
+        if res == "noload":
+            noload += 1
+            log.warning("profil de @%s non charge (%d de suite)", user, noload)
+            if noload >= 3:
+                log.warning("3 profils non charges de suite : connexion ou Instagram lent, reprise au prochain passage")
+                return done, "slow"
+            continue
+        fails += 1
+        log.warning("echec du desabonnement de @%s (%d de suite)", user, fails)
+        if fails >= 3:
+            log.warning("3 echecs de suite : interface modifiee ? voir data/debug et la skill maj-selecteurs")
+            return done, "broken"
     return done, "ok"
 
 
@@ -935,6 +1006,8 @@ def run_outcome(status, kind, pause, error):
         return f"réaction d'Instagram ({kind}), pause de {hours} h, quotas ramenés à {factor * 100:.0f} %", None
     if status == "stop":
         return "arrêté avant la fin (plafond horaire, plage horaire ou temps du jour), reprise au prochain passage", None
+    if status == "slow":
+        return "pages Instagram qui ne chargent pas (connexion ou Instagram lent), reprise au prochain passage", None
     return "OK", None
 
 
@@ -961,7 +1034,31 @@ def format_summary(st, cfg, started, outcome, days, budget):
         lines.append("Nouveaux abonnements : " + ", ".join(followed))
     if unfollowed:
         lines.append("Désabonnements : " + ", ".join(unfollowed))
+    given_up = st.given_up()
+    if given_up:
+        lines.append("Désabonnements abandonnés, à faire à la main : " + ", ".join(given_up))
     return "\n".join(lines)
+
+
+def startup_stuck(cfg, notify):
+    """Minuterie du demarrage : un appel bloque (Chrome sature, bureau virtuel) ne doit pas occuper la tache
+    planifiee pendant des heures (les relances horaires sont ignorees tant qu'elle tourne, et le temps
+    du jour fond). Alerte, ferme le navigateur du profil, libere le verrou et termine le processus."""
+    minutes = cfg["startup_minutes"]
+    log.error("Demarrage bloque depuis %d min (navigateur, bureau virtuel ou connexion) : arret du passage", minutes)
+    try:  # autre thread : sa propre connexion SQLite
+        send_alert(State(DB_PATH), notify, "startup", f"Échec : démarrage bloqué depuis {minutes} min (navigateur, "
+                   "bureau virtuel ou connexion), nouvel essai au prochain passage")
+    except Exception as e:
+        log.warning("Alerte Telegram non envoyee (%s)", e)
+    for pid in profile_pids():
+        try:
+            psutil.Process(pid).kill()
+        except psutil.Error:
+            pass
+    LOCK.unlink(missing_ok=True)
+    logging.shutdown()
+    os._exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -1005,6 +1102,9 @@ def cmd_status(cfg):
     factor = float(st.get_meta("quota_factor") or 1.0)
     print(f"Abonnements en cours (faits par le script) : {st.count('unfollowed_on IS NULL')}")
     print(f"A desabonner maintenant                    : {len(st.due(days, 10**6))}")
+    given_up = st.given_up()
+    if given_up:
+        print(f"Desabonnements abandonnes (a la main)      : {len(given_up)} ({', '.join(given_up)})")
     print(f"Abonnements aujourd'hui                    : {st.followed_today()} / {follow_budget(st, cfg)} autorises"
           f" (plafond {cfg['follows_per_day']}, coefficient {factor:.2f})")
     print(f"Total historique                           : {st.count()}")
@@ -1115,8 +1215,8 @@ def cmd_run(cfg, here, force=False):
     if left is not None and left < 5:
         log.info("Temps de passage du jour deja utilise (%d min) : aucune action avant demain", cfg["daily_minutes"])
         return 0
-    cfg["_deadline"] = now() + timedelta(minutes=left) if left is not None else None
     started = now()
+    ready = None  # fin du demarrage : le temps de passage du jour ne compte qu'a partir de la
     longest = max(cfg["unfollow_days_max"], base)
 
     def fixed_days():  # groupe temoin : une part des comptes reste suivie le delai le plus long
@@ -1133,8 +1233,12 @@ def cmd_run(cfg, here, force=False):
                f"en attente, {avail}")
     if cfg["keep_awake"]:
         keep_awake(True)
+    watchdog = threading.Timer(cfg["startup_minutes"] * 60, startup_stuck, (cfg, notify))
+    watchdog.daemon = True
+    watchdog.start()
     try:
         with sync_playwright() as p:
+            log.info("Ouverture du navigateur")
             ctx = launch(p, cfg, hidden=not here)
             created = []
             try:
@@ -1146,6 +1250,10 @@ def cmd_run(cfg, here, force=False):
                     log.error("Session Instagram absente ou expiree : relance 'insta_rotate.py login'")
                     status, error = "session", None
                     return 3
+                watchdog.cancel()
+                ready = now()
+                left = minutes_left(st, cfg)
+                cfg["_deadline"] = ready + timedelta(minutes=left) if left is not None else None
                 if analysis:
                     if st.get_meta("last_scan_on") != today().isoformat():  # une lecture par jour
                         scan = scan_my_followers(page, cfg["username"], st, cfg)[0]
@@ -1210,7 +1318,9 @@ def cmd_run(cfg, here, force=False):
         error = f"{type(e).__name__}: {(str(e).splitlines() or [''])[0][:200]}"
         return 1
     finally:
-        add_run_time(st, started)
+        watchdog.cancel()
+        if ready:
+            add_run_time(st, ready)
         keep_awake(False)
         try:  # fin du passage annoncee dans tous les cas, sans jamais faire echouer le passage
             outcome, code = run_outcome(status, kind, pause, error)

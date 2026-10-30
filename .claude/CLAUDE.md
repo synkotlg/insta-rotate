@@ -36,7 +36,7 @@ bureau virtuel dedie.
   en cas d'erreur ou d'interruption : statut, abonnements / desabonnements du passage et du jour, temps de passage,
   delai courant, follow-back, pseudos.
 - Alertes (`send_alert`, problemes a regler a la main : session expiree, intervention requise, desabonnements en
-  echec, erreur, profil ou sources absents) : une par jour au plus pour un meme probleme (meta last_alert), et pas
+  echec, erreur, demarrage bloque, profil ou sources absents) : une par jour au plus pour un meme probleme (meta last_alert), et pas
   de "Lancement" tant qu'une alerte du jour est en cours ; un passage termine sans alerte, ou `login`, la leve.
 - Test : `.\.venv\Scripts\python.exe telegram_notify.py "test" --prefix "[insta-rotate] "` (lit .env du dossier
   courant). Un envoi rate n'interrompt jamais le passage (avertissement dans log.txt) ; le token n'est jamais logge.
@@ -59,7 +59,8 @@ bureau virtuel dedie.
 
 ## Temps de passage (PC non allume toute la journee)
 - `daily_minutes` (180 par defaut, 0 = illimite) : temps de passage maximal par jour, cumule sur tous les passages
-  (meta run_seconds:<date>). Le passage s'arrete proprement a l'echeance (`cfg["_deadline"]`, lue par `throttle` et
+  (meta run_seconds:<date>), compte a partir de la connexion a Instagram (le demarrage n'est pas decompte). Le
+  passage s'arrete proprement a l'echeance (`cfg["_deadline"]`, lue par `throttle` et
   `human_pause`) ; les desabonnements passent avant les abonnements. Le travail non fait n'est pas rattrape (pas de rafale).
 - A rythme prudent : environ max_follows_per_hour abonnements ou max_unfollows_per_hour desabonnements par heure de PC
   allume. Le volume du jour est donc fixe par le temps disponible, pas par follows_per_day.
@@ -76,7 +77,7 @@ bureau virtuel dedie.
   retirer : sans lui, une fois le delai raccourci, les follow-back tardifs ne sont plus observes.
 - L'ordre de la liste d'abonnes n'est pas fiable (pas chronologique) : elle est lue en entier, plafonnee a
   `followback_scan_rows`.
-- Une erreur pendant cette lecture (liste disparue, delai depasse) ne fait pas echouer le passage : capture
+- Une erreur pendant cette lecture ou son ouverture (liste disparue, delai depasse) ne fait pas echouer le passage : capture
   `scan-error`, mesure du jour ignoree (relue au passage suivant), puis desabonnements et abonnements. Seul un
   navigateur ferme arrete le passage.
 
@@ -98,3 +99,20 @@ bureau virtuel dedie.
   (`remove_desktops`), sauf s'il y reste une fenetre. Un bureau deja present n'est jamais supprime : si tu as
   deja `virtual_desktop` bureaux, la fenetre va sur le tien.
 - L'interface web d'Instagram change souvent : voir la skill maj-selecteurs.
+
+## Robustesse (le passage ne doit pas rester bloque)
+- Desabonnement en echec : le compte passe en fin de file (colonne unfollow_fails) et est abandonne apres
+  MAX_UNFOLLOW_FAILS (3) echecs, tous passages confondus ; `status` et le resume Telegram le listent (a desabonner a
+  la main). Dans un passage : 3 echecs d'interface de suite -> arret "broken" (alerte) ; 3 profils non charges de
+  suite (page blanche, delai depasse) -> arret "slow" (sans alerte, reprise au passage suivant).
+- Deja plus suivi ("Suivre" / "Suivre en retour", NOT_FOLLOWING_RE) ou compte introuvable : enregistre sans
+  unfollowed_at (note "deja plus suivi" / "introuvable"), hors plafonds horaire et journalier, sans pause longue.
+- Une page lente ne fait pas echouer le passage : source suivante, compte suivant (en fin de file) ou mesure ignoree.
+  Un navigateur ferme ou une connexion coupee l'arretent ("Erreur inattendue").
+- Demarrage (navigateur, bureau virtuel, connexion) limite a `startup_minutes` (8) par une minuterie
+  (`startup_stuck`) : au-dela, alerte, navigateur du profil tue, verrou libere, processus arrete. Sans elle, un
+  appel bloque occupe la tache planifiee (relances horaires ignorees) et le bureau virtuel cree reste en place.
+- Verrou data\run.lock : ignore si le processus note n'est plus insta_rotate.py (PC eteint pendant un passage,
+  numero de processus repris par Windows).
+- Repli sur le Chromium de Playwright seulement si le navigateur de `browser_channel` manque, pas sur un demarrage
+  trop lent. Ce Chromium n'est pas installe par setup.ps1 (`.\.venv\Scripts\playwright.exe install chromium`).
