@@ -28,6 +28,10 @@ from datetime import date, datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+import math
+
+_mouse_pos = {}
+
 import psutil
 from playwright.sync_api import Error as PWError
 from playwright.sync_api import TimeoutError as PWTimeout
@@ -742,13 +746,103 @@ def open_followers(page, seed):
     page.wait_for_timeout(rnd(1500, 2500))
     return dlg
 
+def _ease_in_out(t):
+    return 0.5 - math.cos(math.pi * t) / 2
+
+def _bezier(p0, p1, p2, p3, t):
+    u = 1 - t
+    return (u**3 * p0[0] + 3 * u**2 * t * p1[0] + 3 * u * t**2 * p2[0] + t**3 * p3[0],u**3 * p0[1] + 3 * u**2 * t * p1[1] + 3 * u * t**2 * p2[1] + t**3 * p3[1],)
+
+def _curve(page, start, end):
+    sx, sy = start
+    ex, ey = end
+    dist = math.hypot(ex - sx, ey - sy)
+    if dist < 2:
+        return
+    nx, ny = -(ey - sy) / dist, (ex - sx) / dist
+    bend = random.uniform(0.08, 0.3) * dist * random.choice((-1, 1))
+    a, b = random.uniform(0.15, 0.4), random.uniform(0.6, 0.85)
+    c1 = (sx + (ex - sx) * a + nx * bend * random.uniform(0.6, 1.2),
+          sy + (ey - sy) * a + ny * bend * random.uniform(0.6, 1.2))
+    c2 = (sx + (ex - sx) * b + nx * bend * random.uniform(0.2, 0.9),
+          sy + (ey - sy) * b + ny * bend * random.uniform(0.2, 0.9))
+    steps = max(10, min(60, int(dist / random.uniform(7, 14))))
+    for i in range(1, steps + 1):
+        x, y = _bezier((sx, sy), c1, c2, (ex, ey), _ease_in_out(i / steps))
+        shake = 0.9 if i < steps else 0
+        page.mouse.move(max(0, x + random.gauss(0, shake)), max(0, y + random.gauss(0, shake)))
+        page.wait_for_timeout(random.uniform(6, 18))
+
+def human_move(page, x, y):
+    start = _mouse_pos.get(id(page), (0, 0))
+    dist = math.hypot(x - start[0], y - start[1])
+    if dist > 150 and random.random() < 0.15:
+        over = random.uniform(6, 22)
+        ox = x + (x - start[0]) / dist * over + random.uniform(-5, 5)
+        oy = y + (y - start[1]) / dist * over + random.uniform(-5, 5)
+        _curve(page, start, (ox, oy))
+        page.wait_for_timeout(random.uniform(40, 140))
+        _curve(page, (ox, oy), (x, y))
+    else:
+        _curve(page, start, (x, y))
+    _mouse_pos[id(page)] = (x, y)
+
+def _wheel_gesture(page, distance):
+    sign = 1 if distance > 0 else -1
+    distance = abs(distance)
+    ticks = max(3, int(distance / random.uniform(45, 90)))
+    p, q = random.uniform(0.3, 0.7), random.uniform(1.4, 2.6)
+    weights = [((i + 0.5) / ticks) ** p * (1 - (i + 0.5) / ticks) ** q for i in range(ticks)]
+    total = sum(weights)
+    for i, w in enumerate(weights):
+        delta = round(distance * w / total * random.uniform(0.85, 1.15))
+        if delta:
+            page.mouse.wheel(0, sign * delta)
+        page.wait_for_timeout(random.uniform(10, 22) + 30 * i / ticks)
+
+def _inside(pos, box, margin=10):
+    return (pos is not None
+            and box["x"] + margin < pos[0] < box["x"] + box["width"] - margin
+            and box["y"] + margin < pos[1] < box["y"] + box["height"] - margin)
 
 def scroll_dialog(page, dlg):
     box = dlg.bounding_box()
     if box:
-        page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-    page.mouse.wheel(0, random.randint(500, 900))
-    page.wait_for_timeout(rnd(1800, 3200))
+        pos = _mouse_pos.get(id(page))
+        if not _inside(pos, box):
+            human_move(page,
+                       box["x"] + box["width"] * random.uniform(0.3, 0.7),
+                       box["y"] + box["height"] * random.uniform(0.35, 0.75))
+        elif random.random() < 0.3:
+            human_move(page,
+                       min(max(pos[0] + random.uniform(-40, 40), box["x"] + 20), box["x"] + box["width"] - 20),
+                       min(max(pos[1] + random.uniform(-30, 30), box["y"] + 20), box["y"] + box["height"] - 20))
+    back = random.randint(60, 180) if random.random() < 0.12 else 0
+    target = (random.randint(450, 950) if random.random() < 0.8 else random.randint(950, 1400)) + back
+    n = random.choices((1, 2, 3), weights=(45, 40, 15))[0]
+    shares = [random.uniform(0.6, 1.4) for _ in range(n)]
+    for k, share in enumerate(shares):
+        _wheel_gesture(page, target * share / sum(shares))
+        if k < n - 1:
+            page.wait_for_timeout(random.uniform(120, 700))
+    if back:
+        page.wait_for_timeout(random.uniform(250, 650))
+        _wheel_gesture(page, -back)
+    r = random.random()
+    if r < 0.08:
+        pause = random.uniform(4500, 9000)
+    elif r < 0.25:
+        pause = random.uniform(700, 1400)
+    else:
+        pause = random.lognormvariate(math.log(2300), 0.25)
+    if box and random.random() < 0.3:
+        split = random.uniform(0.3, 0.7)
+        page.wait_for_timeout(pause * split)
+        x, y = _mouse_pos.get(id(page), (box["x"] + box["width"] / 2, box["y"] + box["height"] / 2))
+        human_move(page, x + random.uniform(-25, 25), y + random.uniform(-20, 20))
+        page.wait_for_timeout(pause * (1 - split))
+    else:
+        page.wait_for_timeout(pause)
 
 
 def follow_from_seed(page, seed, quota, st, cfg, counter, fixed_days=lambda: None):
