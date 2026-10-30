@@ -1,7 +1,8 @@
 # insta-rotate
 
 Rotation d'abonnements Instagram (Windows, Python + Playwright). Chaque jour : lecture de la liste de tes abonnes
-(detection des follow-back), desabonnement des comptes dont le delai est atteint, puis abonnement a de nouveaux
+(detection des follow-back), desabonnement des comptes dont le delai est atteint et qui ne t'ont pas suivi en
+retour, puis abonnement a de nouveaux
 comptes tires des abonnes de comptes sources francais. Tache planifiee (09:00 par defaut), fenetre envoyee sur un
 bureau virtuel dedie.
 
@@ -45,16 +46,21 @@ bureau virtuel dedie.
 - Montee en charge : `follow_budget()` = min(follows_per_day, ramp_start + ramp_step x jours d'abonnements precedents)
   x quota_factor.
 - Plafonds glissants cumules sur tous les passages : max_follows_per_hour, max_unfollows_per_hour ; plafonds du jour :
-  max_unfollows_per_day ; max_following (plus d'abonnement si les desabonnements ne suivent pas). Les pauses sont
+  max_unfollows_per_day ; max_following (plus d'abonnement au-dela, follow-back gardes compris). Les pauses sont
   calees sur 3600 / plafond (`human_pause`) ; `throttle()` attend ou arrete le passage.
+- Profil ouvert sans clic (deja plus suivi, introuvable, echec, page non chargee) ou source inaccessible :
+  `profile_gap()`, pause de `profile_gap_seconds` (20 a 60 s) avant la page suivante, pour ne pas ouvrir plusieurs
+  profils en quelques secondes.
 - Plage horaire `active_hours`, jour de repos (`rest_day_chance`, tire par date, seulement si la
   veille a eu des abonnements ou desabonnements : une veille sans action, PC eteint compris, vaut deja repos).
 - Une seule source par passage, utilisee jusqu'au quota, en rotation dans l'ordre de seeds.txt (meta last_seed :
   le passage suivant part de la source d'apres). La source suivante n'est ouverte dans le meme passage que si
   celle-ci est epuisee ou inaccessible, `seeds_per_run` sources au plus.
 - Reactions d'Instagram (`block_kind`) : "limit" -> pause block_cooldown_hours, quota_factor x 0,5 ; "warning" ->
-  warning_cooldown_hours, quota_factor x 0,25 ; "attention" (verification d'identite, suspension, deconnexion) ->
-  meta needs_attention, arret total jusqu'a `login`. La pause double a chaque blocage rapproche (14 jours max) ;
+  warning_cooldown_hours, quota_factor x 0,25 ; "attention" (verification d'identite, suspension, deconnexion, en
+  cours de passage ou des l'ouverture) -> `register_attention` : meta needs_attention, arret total jusqu'a `login`,
+  plus la pause et les quotas de "warning", comptes des la detection (le `login` ne les leve pas). La pause double
+  a chaque blocage rapproche (14 jours max) ;
   quota_factor remonte de 0,1 par jour sans reaction. Trois clics ignores de suite = limitation silencieuse ("limit").
 
 ## Temps de passage (PC non allume toute la journee)
@@ -68,7 +74,9 @@ bureau virtuel dedie.
 
 ## Delai de desabonnement adaptatif
 - Chaque jour (une lecture), scan de la liste de TES abonnes (cle `username` de config.json, obligatoire pour la
-  mesure) : un compte suivi qui y apparait recoit `followed_back_on`.
+  mesure) : un compte suivi qui y apparait recoit `followed_back_on` et n'est plus jamais desabonne (`due`,
+  `kept`). Sans `username`, pas de mesure : tous les comptes sont desabonnes apres le delai. Un follow-back qui se
+  desabonne ensuite de toi n'est pas detecte (le compte reste suivi).
 - `followback_stats()` : estimation Kaplan-Meier. Un compte desabonne sans follow-back est "censure" (observe
   jusqu'a ce jour), pas un echec. Delai retenu = plus petit nombre de jours qui capte `adapt_target_share` (90 %) des
   follow-back obtenus sur `unfollow_days_max`, borne par `unfollow_days_min` / `unfollow_days_max`.
@@ -106,7 +114,8 @@ bureau virtuel dedie.
   la main). Dans un passage : 3 echecs d'interface de suite -> arret "broken" (alerte) ; 3 profils non charges de
   suite (page blanche, delai depasse) -> arret "slow" (sans alerte, reprise au passage suivant).
 - Deja plus suivi ("Suivre" / "Suivre en retour", NOT_FOLLOWING_RE) ou compte introuvable : enregistre sans
-  unfollowed_at (note "deja plus suivi" / "introuvable"), hors plafonds horaire et journalier, sans pause longue.
+  unfollowed_at (note "deja plus suivi" / "introuvable"), hors plafonds horaire et journalier, sans pause longue
+  (seulement `profile_gap`).
 - Une page lente ne fait pas echouer le passage : source suivante, compte suivant (en fin de file) ou mesure ignoree.
   Un navigateur ferme ou une connexion coupee l'arretent ("Erreur inattendue").
 - Demarrage (navigateur, bureau virtuel, connexion) limite a `startup_minutes` (8) par une minuterie

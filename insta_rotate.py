@@ -2,8 +2,8 @@
 """
 insta_rotate.py - Rotation d'abonnements Instagram.
 
-Chaque jour : desabonnement des comptes suivis par ce script depuis N jours,
-puis abonnement a de nouveaux comptes pris dans les abonnes de comptes sources.
+Chaque jour : desabonnement des comptes suivis par ce script depuis N jours (sauf ceux qui
+t'ont suivi en retour), puis abonnement a de nouveaux comptes pris dans les abonnes de comptes sources.
 Le navigateur utilise un profil persistant : connexion manuelle une seule fois.
 
   python insta_rotate.py login     connexion manuelle (une seule fois)
@@ -127,6 +127,8 @@ DEFAULTS = {
     "pause_jitter": [0.6, 1.5],
     "long_pause_every": 10,
     "long_pause_seconds": [120, 300],
+    # apres un profil ouvert sans clic (deja plus suivi, introuvable, echec) : pas de rafale de pages
+    "profile_gap_seconds": [20, 60],
     "active_hours": [8, 23],
     "daily_minutes": 180,
     "keep_awake": True,
@@ -265,9 +267,13 @@ class State:
 
     def given_up(self):
         """Comptes toujours suivis dont le desabonnement a echoue MAX_UNFOLLOW_FAILS fois : a faire a la main."""
-        rows = self.db.execute("SELECT username FROM users WHERE unfollowed_on IS NULL AND unfollow_fails >= ? "
-                               "ORDER BY followed_on, username", (MAX_UNFOLLOW_FAILS,)).fetchall()
+        rows = self.db.execute("SELECT username FROM users WHERE unfollowed_on IS NULL AND followed_back_on IS NULL "
+                               "AND unfollow_fails >= ? ORDER BY followed_on, username", (MAX_UNFOLLOW_FAILS,)).fetchall()
         return [r[0] for r in rows]
+
+    def kept(self):
+        """Comptes suivis qui t'ont suivi en retour : gardes, jamais desabonnes (voir due)."""
+        return self.count("unfollowed_on IS NULL AND followed_back_on IS NOT NULL")
 
     def mark_followed_back(self, user):
         self.db.execute("UPDATE users SET followed_back_on=? WHERE username=? AND followed_back_on IS NULL",
@@ -305,11 +311,13 @@ class State:
         return [r[0] for r in rows]
 
     def due(self, days, limit):
-        """Comptes a desabonner : age >= delai propre au compte, sinon `days` (delai courant). Les comptes deja
-        en echec passent apres les autres (sinon trois echecs en tete de file bloquent chaque passage), ceux
-        qui ont echoue MAX_UNFOLLOW_FAILS fois sont abandonnes (given_up)."""
+        """Comptes a desabonner : age >= delai propre au compte, sinon `days` (delai courant). Ceux qui t'ont
+        suivi en retour sont gardes (kept). Les comptes deja en echec passent apres les autres (sinon trois
+        echecs en tete de file bloquent chaque passage), ceux qui ont echoue MAX_UNFOLLOW_FAILS fois sont
+        abandonnes (given_up)."""
         rows = self.db.execute(
-            "SELECT username FROM users WHERE unfollowed_on IS NULL AND COALESCE(unfollow_fails, 0) < ? "
+            "SELECT username FROM users WHERE unfollowed_on IS NULL AND followed_back_on IS NULL "
+            "AND COALESCE(unfollow_fails, 0) < ? "
             "AND date(followed_on, '+' || COALESCE(fixed_days, ?) || ' days') <= ? "
             "ORDER BY COALESCE(unfollow_fails, 0), followed_on, username LIMIT ?",
             (MAX_UNFOLLOW_FAILS, days, today().isoformat(), limit)).fetchall()
@@ -422,15 +430,28 @@ def follow_budget(st, cfg):
 
 
 def register_block(st, cfg, kind):
-    """Reaction d'Instagram : quotas reduits, pause qui double a chaque blocage rapproche (14 jours max)."""
+    """Reaction d'Instagram : quotas reduits, pause qui double a chaque blocage rapproche (14 jours max).
+    'attention' compte comme 'warning'."""
+    severe = kind in ("warning", "attention")
     streak = int(st.get_meta("block_streak") or 0) + 1
-    factor = max(0.25, float(st.get_meta("quota_factor") or 1.0) * (0.25 if kind == "warning" else 0.5))
-    base = cfg["warning_cooldown_hours"] if kind == "warning" else cfg["block_cooldown_hours"]
+    factor = max(0.25, float(st.get_meta("quota_factor") or 1.0) * (0.25 if severe else 0.5))
+    base = cfg["warning_cooldown_hours"] if severe else cfg["block_cooldown_hours"]
     hours = min(base * 2 ** (streak - 1), 14 * 24)
     st.set_meta("block_streak", str(streak))
     st.set_meta("quota_factor", f"{factor:.2f}")
     st.set_meta("blocked_until", (now() + timedelta(hours=hours)).isoformat(timespec="seconds"))
     st.set_meta("last_clean_on", today().isoformat())  # pas de remontee le jour meme
+    return hours, factor
+
+
+def register_attention(st, cfg):
+    """Verification d'identite, suspension ou deconnexion : arret total jusqu'a 'login', puis pause et quotas
+    reduits comme pour un avertissement. La pause court des maintenant : elle continue apres le 'login'."""
+    st.set_meta("needs_attention", f"{now():%Y-%m-%d %H:%M} verification, suspension ou deconnexion")
+    hours, factor = register_block(st, cfg, "attention")
+    log.error("Instagram demande une intervention (verification d'identite, suspension ou deconnexion) : "
+              "arret total. Regle-le a la main, puis lance 'insta_rotate.py login' ; ensuite pause de %d h "
+              "(comptee d'ici), quotas ramenes a %d %%", hours, factor * 100)
     return hours, factor
 
 
@@ -720,6 +741,16 @@ def human_pause(page, cfg, n, kind):
     secs = 3600 / cfg[f"max_{kind}s_per_hour"] * rnd(*cfg["pause_jitter"])
     if n % cfg["long_pause_every"] == 0:
         secs += rnd(*cfg["long_pause_seconds"])
+    capped_wait(page, cfg, secs)
+
+
+def profile_gap(page, cfg):
+    """Pause apres un profil ouvert sans clic (deja plus suivi, introuvable, echec, page non chargee) ou une
+    source inaccessible : sans elle, plusieurs profils s'ouvrent en quelques secondes."""
+    capped_wait(page, cfg, rnd(*cfg["profile_gap_seconds"]))
+
+
+def capped_wait(page, cfg, secs):
     deadline = cfg.get("_deadline")
     if deadline:  # inutile de dormir au-dela du temps de passage
         secs = min(secs, max(0.0, (deadline - now()).total_seconds()))
@@ -1038,8 +1069,8 @@ def unfollow_pass(page, st, cfg, counter, days):
                 done += 1
                 counter[0] += 1
                 human_pause(page, cfg, counter[0], "unfollow")
-            else:  # aucun clic : pas de pause longue, juste le temps de quitter la page
-                page.wait_for_timeout(rnd(3000, 8000))
+            else:  # aucun clic : pas de pause longue, mais pas de rafale de profils non plus
+                profile_gap(page, cfg)
             continue
         if st.add_unfollow_fail(user) >= MAX_UNFOLLOW_FAILS:
             log.warning("desabonnement de @%s abandonne apres %d echecs : a faire a la main", user, MAX_UNFOLLOW_FAILS)
@@ -1049,12 +1080,14 @@ def unfollow_pass(page, st, cfg, counter, days):
             if noload >= 3:
                 log.warning("3 profils non charges de suite : connexion ou Instagram lent, reprise au prochain passage")
                 return done, "slow"
+            profile_gap(page, cfg)
             continue
         fails += 1
         log.warning("echec du desabonnement de @%s (%d de suite)", user, fails)
         if fails >= 3:
             log.warning("3 echecs de suite : interface modifiee ? voir data/debug et la skill maj-selecteurs")
             return done, "broken"
+        profile_gap(page, cfg)
     return done, "ok"
 
 
@@ -1093,8 +1126,10 @@ def run_outcome(status, kind, pause, error):
         return ("3 désabonnements ratés de suite, interface d'Instagram modifiée ? "
                 "(data/debug, skill maj-selecteurs)"), "broken"
     if status == "blocked" and kind == "attention":
+        hours, factor = pause
         return ("ARRÊT TOTAL : Instagram demande une intervention (vérification d'identité, suspension ou "
-                "déconnexion). Règle-le à la main, puis lance 'insta_rotate.py login'"), "attention"
+                "déconnexion). Règle-le à la main, puis lance 'insta_rotate.py login'. Ensuite pause de "
+                f"{hours} h comptée d'ici, quotas ramenés à {factor * 100:.0f} %"), "attention"
     if status == "blocked":
         hours, factor = pause
         return f"réaction d'Instagram ({kind}), pause de {hours} h, quotas ramenés à {factor * 100:.0f} %", None
@@ -1115,7 +1150,8 @@ def format_summary(st, cfg, started, outcome, days, budget):
         f"Ce passage : {len(followed)} abonnements, {len(unfollowed)} désabonnements",
         f"Aujourd'hui : {st.followed_today()}/{budget} abonnements, {st.unfollowed_today()} désabonnements, "
         f"{used:.0f} min de passage" + (f" sur {cfg['daily_minutes']}" if cfg["daily_minutes"] else ""),
-        f"Comptes suivis par le script : {st.count('unfollowed_on IS NULL')}, désabonnement après {days} j",
+        f"Comptes suivis par le script : {st.count('unfollowed_on IS NULL')} dont {st.kept()} follow-back gardés, "
+        f"désabonnement des autres après {days} j",
     ]
     if cfg["adaptive_delay"] and cfg["username"]:
         stats = followback_stats(st.samples(cfg["adapt_window_days"]), cfg, cfg["unfollow_after_days"])
@@ -1179,6 +1215,9 @@ def cmd_login(cfg):
             st = State(DB_PATH)
             st.set_meta("needs_attention", "")
             st.set_meta("last_alert", "")  # le prochain passage annonce de nouveau son lancement
+            until = st.get_meta("blocked_until")
+            if until and now() < datetime.fromisoformat(until):
+                log.info("Pause anti-blocage jusqu'au %s : aucune action du script d'ici la", until)
             if not cfg["username"]:
                 name = input("Ton pseudo Instagram (sert a mesurer les follow-back) : ").strip().lstrip("@").lower()
                 if name:
@@ -1195,6 +1234,7 @@ def cmd_status(cfg):
     stats = followback_stats(st.samples(cfg["adapt_window_days"]), cfg, base)
     factor = float(st.get_meta("quota_factor") or 1.0)
     print(f"Abonnements en cours (faits par le script) : {st.count('unfollowed_on IS NULL')}")
+    print(f"Dont follow-back gardes                    : {st.kept()}")
     print(f"A desabonner maintenant                    : {len(st.due(days, 10**6))}")
     given_up = st.given_up()
     if given_up:
@@ -1291,9 +1331,10 @@ def cmd_run(cfg, here, force=False):
         log.warning("Cle 'username' absente de config.json : pas de mesure des follow-back, delai fixe de %d jours", base)
     budget = follow_budget(st, cfg)
     quota = max(0, budget - st.followed_today())
-    if st.count("unfollowed_on IS NULL") >= cfg["max_following"]:
-        log.warning("%d comptes suivis par le script : pas de nouvel abonnement tant que les desabonnements "
-                    "n'ont pas rattrape leur retard", cfg["max_following"])
+    following = st.count("unfollowed_on IS NULL")
+    if following >= cfg["max_following"]:
+        log.warning("max_following atteint : %d comptes suivis par le script, dont %d follow-back gardes ; "
+                    "pas de nouvel abonnement", following, st.kept())
         quota = 0
     room = max(0, cfg["max_unfollows_per_day"] - st.unfollowed_today())
     if not quota and not (room and st.due(days, 1)):
@@ -1341,6 +1382,11 @@ def cmd_run(cfg, here, force=False):
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
                 page.set_default_timeout(15000)
                 if not logged_in(page):
+                    if "/accounts/login" not in page.url and block_kind(page) == "attention":
+                        # verification d'identite des l'ouverture : meme arret et meme pause qu'en cours de passage
+                        status, kind, error = "blocked", "attention", None
+                        pause = register_attention(st, cfg)
+                        return 5
                     log.error("Session Instagram absente ou expiree : relance 'insta_rotate.py login'")
                     status, error = "session", None
                     return 3
@@ -1372,6 +1418,7 @@ def cmd_run(cfg, here, force=False):
                         n, s = follow_from_seed(page, seed, remaining, st, cfg, counter, fixed_days)
                         if s == "skip":  # source inaccessible : ecartee apres 3 echecs
                             st.set_meta(f"seed_fail:{seed}", str(int(st.get_meta(f"seed_fail:{seed}") or 0) + 1))
+                            profile_gap(page, cfg)
                             continue
                         st.set_meta(f"seed_fail:{seed}", "0")
                         st.set_meta("last_seed", seed)
@@ -1395,9 +1442,7 @@ def cmd_run(cfg, here, force=False):
                 remove_desktops(created)
 
         if status == "blocked" and kind == "attention":
-            st.set_meta("needs_attention", f"{now():%Y-%m-%d %H:%M} verification, suspension ou deconnexion")
-            log.error("Instagram demande une intervention (verification d'identite, suspension ou deconnexion) : "
-                      "arret total. Regle-le a la main, puis lance 'insta_rotate.py login'")
+            pause = register_attention(st, cfg)
         elif status == "blocked":
             pause = register_block(st, cfg, kind)
             log.warning("Reaction d'Instagram (%s) : pause de %d h, quotas ramenes a %d %%",
