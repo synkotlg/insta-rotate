@@ -27,6 +27,7 @@ import time
 from datetime import date, datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import math
 
@@ -151,6 +152,7 @@ DEFAULTS = {
     "virtual_desktop": 2,
     "browser_channel": "msedge",
     "locale": "fr-FR",
+    # horloge du script (plage horaire, jours, plafonds, log) et du navigateur, quel que soit le fuseau du PC
     "timezone": "Europe/Paris",
     "debug_screenshots": True,
     # prefixe des messages Telegram (le meme bot sert a plusieurs projets)
@@ -158,6 +160,7 @@ DEFAULTS = {
 }
 
 LEGACY_SEEDS = ["squeezie", "lenasituations", "booba", "k.mbappe"]  # ancienne liste par defaut de config.json
+TZ = ZoneInfo(DEFAULTS["timezone"])  # remplace par la cle timezone de config.json (load_config)
 
 
 def norm_handles(items):
@@ -169,10 +172,12 @@ def read_seeds_file(path):
 
 
 def load_config():
+    global TZ
     cfg = dict(DEFAULTS)
     path = ROOT / "config.json"
     if path.exists():
         cfg.update(json.loads(path.read_text(encoding="utf-8")))
+    TZ = ZoneInfo(cfg["timezone"])
     own = norm_handles(cfg.get("seeds") or [])
     seeds_file = ROOT / "seeds.txt"
     if own and own != LEGACY_SEEDS:
@@ -190,7 +195,8 @@ def setup_log():
     logger = logging.getLogger("rotate")
     logger.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S")
-    fh = RotatingFileHandler(DATA / "log.txt", maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    fmt.converter = lambda secs: datetime.fromtimestamp(secs, TZ).timetuple()  # heure du script, pas du PC
+    fh =RotatingFileHandler(DATA / "log.txt", maxBytes=1_000_000, backupCount=3, encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     if sys.stdout is not None:  # pythonw : pas de console
@@ -216,11 +222,12 @@ def rnd(lo, hi):
 # Etat (SQLite) : qui a ete suivi, quand, et s'il a ete desuivi
 # ---------------------------------------------------------------------------
 def today():
-    return date.today()
+    return now().date()
 
 
 def now():
-    return datetime.now()
+    """Heure de la cle timezone (Paris), pas celle du PC. Sans fuseau attache, comme les horodatages de state.db."""
+    return datetime.now(TZ).replace(tzinfo=None)
 
 
 class State:
@@ -709,7 +716,7 @@ def shot(page, cfg, name):
         return
     try:
         SHOTS.mkdir(parents=True, exist_ok=True)
-        page.screenshot(path=str(SHOTS / f"{datetime.now():%Y%m%d-%H%M%S}-{name}.png"))
+        page.screenshot(path=str(SHOTS / f"{now():%Y%m%d-%H%M%S}-{name}.png"))
         for old in sorted(SHOTS.glob("*.png"))[:-30]:
             old.unlink()
     except Exception:
@@ -1233,6 +1240,8 @@ def cmd_status(cfg):
     days = int(st.get_meta("current_days") or base) if cfg["adaptive_delay"] else base
     stats = followback_stats(st.samples(cfg["adapt_window_days"]), cfg, base)
     factor = float(st.get_meta("quota_factor") or 1.0)
+    print(f"Heure du script                            : {now():%Y-%m-%d %H:%M} ({cfg['timezone']}, "
+          f"plage {cfg['active_hours'][0]}h-{cfg['active_hours'][1]}h)")
     print(f"Abonnements en cours (faits par le script) : {st.count('unfollowed_on IS NULL')}")
     print(f"Dont follow-back gardes                    : {st.kept()}")
     print(f"A desabonner maintenant                    : {len(st.due(days, 10**6))}")

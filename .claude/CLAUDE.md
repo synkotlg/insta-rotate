@@ -6,6 +6,14 @@ retour, puis abonnement a de nouveaux
 comptes tires des abonnes de comptes sources francais. Tache planifiee (09:00 par defaut), fenetre envoyee sur un
 bureau virtuel dedie.
 
+## Fuseau horaire
+- Toutes les heures du script sont celles de Paris (cle `timezone`, "Europe/Paris"), pas celles du PC : `now()` /
+  `today()` (plage horaire, jours, plafonds, horodatages de state.db sans fuseau attache), log.txt, captures,
+  navigateur (`timezone_id`). Sous Windows, zoneinfo a besoin du paquet tzdata (requirements.txt).
+- setup.ps1 : `-Time` et 23:00 sont des heures de Paris. La tache garde un instant UTC, donc un changement de fuseau
+  du PC ne la decale pas (pas besoin de relancer setup.ps1). Depart a `-Time` heure d'ete, fin a 23:00 heure
+  d'hiver : en hiver le premier passage a lieu une heure plus tot, le script ignore ceux hors plage.
+
 ## Commandes
 - `.\setup.ps1` : venv, dependances, tache planifiee "InstaRotate" (options `-Time 09:00`, `-DailyOnly`, `-NoTask`, `-Remove`),
   declenchee 5 min apres chaque ouverture de session et chaque jour, puis toutes les heures jusqu'a 23:00 (un passage

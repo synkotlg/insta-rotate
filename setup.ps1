@@ -1,7 +1,7 @@
 # setup.ps1 - installe les dependances et cree la tache planifiee.
 #   .\setup.ps1                  installation + tache (a chaque ouverture de session et chaque jour a 09:00,
-#                                puis toutes les heures jusqu'a 23:00)
-#   .\setup.ps1 -Time 18:30      autre heure pour le declenchement quotidien
+#                                puis toutes les heures jusqu'a 23:00 ; heures de Paris, quel que soit le fuseau du PC)
+#   .\setup.ps1 -Time 18:30      autre heure (de Paris) pour le declenchement quotidien
 #   A relancer apres tout deplacement du dossier : la tache contient le chemin complet du script.
 #   .\setup.ps1 -DailyOnly       pas de declenchement a l'ouverture de session
 #   .\setup.ps1 -NoTask          dependances seulement
@@ -34,12 +34,21 @@ if (-not $NoTask) {
     $pythonw = Join-Path $root ".venv\Scripts\pythonw.exe"
     $user = "$env:USERDOMAIN\$env:USERNAME"
     $action = New-ScheduledTaskAction -Execute $pythonw -Argument "`"$root\insta_rotate.py`" run" -WorkingDirectory $root
-    $daily = New-ScheduledTaskTrigger -Daily -At $Time -RandomDelay (New-TimeSpan -Minutes 45)
+    # $Time et 23:00 sont des heures de Paris (horloge du script). La tache garde un instant fixe (UTC) : un
+    # changement de fuseau du PC ne la decale pas, l'heure d'ete de Paris si (une heure). Debut a $Time heure d'ete,
+    # fin a 23:00 heure d'hiver : en hiver le premier passage a lieu une heure plus tot, le script ignore ceux qui
+    # tombent hors de sa plage horaire.
+    $paris = [TimeZoneInfo]::FindSystemTimeZoneById("Romance Standard Time")
+    $offsets = @(1, 7) | ForEach-Object { $paris.GetUtcOffset((New-Object DateTime (Get-Date).Year, $_, 15)) } | Sort-Object
+    $first = [TimeSpan]::Parse($Time) - $offsets[-1]
+    $last = [TimeSpan]::Parse("23:00") - $offsets[0]
+    $at = ([DateTime]::SpecifyKind([DateTime]::UtcNow.Date, "Utc") + $first).ToLocalTime()
+    $daily = New-ScheduledTaskTrigger -Daily -At $at -RandomDelay (New-TimeSpan -Minutes 45)
     # relance toutes les heures jusqu'a 23:00 (fin de active_hours par defaut) : un passage rate (PC eteint ou en
     # veille), hors plage ou interrompu par une erreur reprend dans l'heure. Sans risque de rafale : temps du jour,
     # quotas et plafonds horaires sont cumules sur tous les passages, et un passage sans travail n'ouvre pas le navigateur.
-    $hours = [Math]::Max(1, 23 - ([datetime]$Time).Hour)
-    $daily.Repetition = (New-ScheduledTaskTrigger -Once -At $Time -RepetitionInterval (New-TimeSpan -Hours 1) `
+    $hours = [Math]::Max(1, [Math]::Ceiling(($last - $first).TotalHours))
+    $daily.Repetition = (New-ScheduledTaskTrigger -Once -At $at -RepetitionInterval (New-TimeSpan -Hours 1) `
         -RepetitionDuration (New-TimeSpan -Hours $hours)).Repetition
     $triggers = @($daily)
     if (-not $DailyOnly) {
@@ -52,7 +61,8 @@ if (-not $NoTask) {
         -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 10)
     $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $triggers -Settings $settings -Principal $principal -Force | Out-Null
-    $sched = "chaque jour a $Time (plus un delai aleatoire jusqu'a 45 min), puis toutes les heures pendant $hours h"
+    $sched = "chaque jour a $($at.ToString('HH:mm')) heure du PC ($Time a Paris l'ete, une heure plus tot l'hiver), " +
+        "plus un delai aleatoire jusqu'a 45 min, puis toutes les heures pendant $hours h"
     $when = if ($DailyOnly) { $sched } else { "5 min apres chaque ouverture de session et $sched" }
     Write-Host "Tache $taskName creee : $when."
 }

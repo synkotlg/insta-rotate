@@ -1,3 +1,4 @@
 playwright>=1.48
 psutil>=5.9
 pyvda>=0.6.0; sys_platform == "win32"
+tzdata; sys_platform == "win32"
