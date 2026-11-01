@@ -40,7 +40,10 @@ bureau virtuel dedie.
 
 ## Notifications Telegram
 - Seulement pour `run`, et seulement pour un passage qui ouvre le navigateur (pas pour les relances horaires sans
-  travail : hors plage, repos, pause anti-blocage, rien a faire). Prefixe `[insta-rotate] ` (cle `notify_name`).
+  travail : hors plage, repos, pause anti-blocage, rien a faire), sauf le planning de la semaine. Prefixe `[insta-rotate] ` (cle `notify_name`).
+- Planning de la semaine (`announce_week`) : une fois par semaine (meta rest_week_sent), au premier `run` dans la
+  plage horaire (avant le test du jour de repos, meme sans travail), chaque jour jusqu'a dimanche en "repos" ou
+  "actif". Envoi rate ou Telegram absent : nouvel essai au passage suivant. `status` affiche aussi les repos.
 - "Lancement" avant l'ouverture du navigateur, puis resume (`format_summary`) dans le `finally` de `cmd_run`, y compris
   en cas d'erreur ou d'interruption : statut, abonnements / desabonnements du passage et du jour, temps de passage,
   delai courant, follow-back, pseudos.
@@ -59,8 +62,10 @@ bureau virtuel dedie.
 - Profil ouvert sans clic (deja plus suivi, introuvable, echec, page non chargee) ou source inaccessible :
   `profile_gap()`, pause de `profile_gap_seconds` (20 a 60 s) avant la page suivante, pour ne pas ouvrir plusieurs
   profils en quelques secondes.
-- Plage horaire `active_hours`, jour de repos (`rest_day_chance`, tire par date, seulement si la
-  veille a eu des abonnements ou desabonnements : une veille sans action, PC eteint compris, vaut deja repos).
+- Plage horaire `active_hours`, jours de repos planifies par semaine (`rest_days`, lundi a dimanche) : tires une
+  fois a la premiere demande de la semaine (`rest_day_chance` par jour, jamais deux de suite, ni un lundi apres un
+  dimanche de repos), gardes dans meta rest_week:<lundi>, puis fixes. Les jours deja passes au tirage, et
+  aujourd'hui s'il a deja eu des actions, restent actifs. Un jour actif PC eteint n'est pas rattrape.
 - Une seule source par passage, utilisee jusqu'au quota, en rotation dans l'ordre de seeds.txt (meta last_seed :
   le passage suivant part de la source d'apres). La source suivante n'est ouverte dans le meme passage que si
   celle-ci est epuisee ou inaccessible, `seeds_per_run` sources au plus.

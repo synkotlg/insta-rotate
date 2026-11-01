@@ -417,11 +417,61 @@ def describe(stats):
 # ---------------------------------------------------------------------------
 # Prudence : montee en charge, plafonds horaires, plage horaire, repos, blocages
 # ---------------------------------------------------------------------------
+JOURS = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
+
+
+def day_label(day):
+    return f"{JOURS[day.weekday()]} {day.day}/{day.month:02d}"
+
+
+def week_start(day):
+    return day - timedelta(days=day.weekday())
+
+
+def rest_days(cfg, st, day):
+    """Jours de repos de la semaine (lundi a dimanche) de `day`. Tires une fois, a la premiere demande de la
+    semaine, puis gardes dans meta rest_week:<lundi> : annonces a l'avance (announce_week), ils ne changent plus.
+    Chaque jour a la chance rest_day_chance, jamais deux jours de suite (ni un lundi apres un dimanche de
+    repos). Les jours deja passes au tirage, et aujourd'hui s'il a deja eu des actions, restent actifs."""
+    monday = week_start(day)
+    key = f"rest_week:{monday.isoformat()}"
+    stored = st.get_meta(key)
+    if stored is not None:
+        return [date.fromisoformat(d) for d in stored.split(",") if d]
+    sunday = monday - timedelta(days=1)
+    rest = [sunday] if sunday.isoformat() in (st.get_meta(f"rest_week:{week_start(sunday).isoformat()}") or "") else []
+    rng = random.Random("repos-" + monday.isoformat())  # meme tirage si la base est recreee
+    for i in range(7):
+        d = monday + timedelta(days=i)
+        drawn = rng.random() < cfg["rest_day_chance"]
+        open_day = d > today() or (d == today() and not st.acted_on(d))
+        if drawn and open_day and d - timedelta(days=1) not in rest:
+            rest.append(d)
+    rest = [d for d in rest if d >= monday]
+    st.set_meta(key, ",".join(d.isoformat() for d in rest))
+    log.info("Jours de repos tires pour la semaine du %s : %s", day_label(monday),
+             ", ".join(map(day_label, rest)) or "aucun")
+    return rest
+
+
 def is_rest_day(cfg, st, day):
-    """Jour de repos : tire une fois par date (stable d'un passage a l'autre), seulement si la veille a eu des
-    abonnements ou desabonnements. Une veille sans action (repos, PC eteint, hors plage) vaut deja repos."""
-    drawn = random.Random("repos-" + day.isoformat()).random() < cfg["rest_day_chance"]
-    return drawn and st.acted_on(day - timedelta(days=1))
+    """Jour de repos du planning de la semaine (rest_days) : aucune action ce jour-la."""
+    return day in rest_days(cfg, st, day)
+
+
+def announce_week(cfg, st, notify):
+    """Planning de la semaine sur Telegram, une fois par semaine (meta rest_week_sent) : du jour de l'envoi a
+    dimanche, chaque jour en repos ou actif. Envoi rate ou Telegram absent : nouvel essai au passage suivant."""
+    monday = week_start(today())
+    if st.get_meta("rest_week_sent") == monday.isoformat():
+        return
+    rest = rest_days(cfg, st, today())
+    days = [today() + timedelta(days=i) for i in range(7 - today().weekday())]
+    n = sum(d in rest for d in days)
+    lines = [f"Planning de la semaine : {n} jour{'s' if n > 1 else ''} de repos (aucune action ces jours-là)"]
+    lines += [f"{day_label(d)} : {'repos' if d in rest else 'actif'}" for d in days]
+    if notify("\n".join(lines)):
+        st.set_meta("rest_week_sent", monday.isoformat())
 
 
 def in_active_hours(cfg, moment):
@@ -1260,7 +1310,9 @@ def cmd_status(cfg):
     print(f"Pause anti-blocage jusqu'au                : {st.get_meta('blocked_until') or '-'}")
     telegram = os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID")
     print(f"Notifications Telegram                     : {'actives' if telegram else 'non configurees (.env)'}")
-    if is_rest_day(cfg, st, today()):
+    rest = rest_days(cfg, st, today())
+    print(f"Jours de repos cette semaine               : {', '.join(map(day_label, rest)) or 'aucun'}")
+    if today() in rest:
         print("Aujourd'hui                                : jour de repos (aucune action, reprise demain)")
     if st.get_meta("needs_attention"):
         print(f"Intervention requise                       : {st.get_meta('needs_attention')}")
@@ -1331,8 +1383,9 @@ def cmd_run(cfg, here, force=False):
     base = cfg["unfollow_after_days"]
     analysis = bool(cfg["adaptive_delay"] and cfg["username"])
     days = int(st.get_meta("current_days") or base) if analysis else base
+    announce_week(cfg, st, notify)  # avant le repos : un lundi de repos est annonce lui aussi
     if not force and is_rest_day(cfg, st, today()):
-        log.info("Jour de repos tire au sort (la veille a eu des actions) : aucune action aujourd'hui, "
+        log.info("Jour de repos (planning de la semaine) : aucune action aujourd'hui, "
                  "%d desabonnement(s) en attente, reprise demain (--force pour passer outre)",
                  len(st.due(days, 10**6)))
         return 0
