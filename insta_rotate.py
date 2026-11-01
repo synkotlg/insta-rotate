@@ -136,6 +136,7 @@ DEFAULTS = {
     # demarrage (navigateur, bureau virtuel, connexion) plus long : alerte et arret du passage
     "startup_minutes": 8,
     "rest_day_chance": 0.15,
+    "rest_days_min": 1,  # jours de repos par semaine au minimum (ajoutes si le tirage n'en donne pas assez)
     "block_cooldown_hours": 48,
     "warning_cooldown_hours": 168,
     # delai adaptatif : mesure du temps de follow-back, puis ajustement du desabonnement
@@ -431,22 +432,29 @@ def week_start(day):
 def rest_days(cfg, st, day):
     """Jours de repos de la semaine (lundi a dimanche) de `day`. Tires une fois, a la premiere demande de la
     semaine, puis gardes dans meta rest_week:<lundi> : annonces a l'avance (announce_week), ils ne changent plus.
-    Chaque jour a la chance rest_day_chance, jamais deux jours de suite (ni un lundi apres un dimanche de
-    repos). Les jours deja passes au tirage, et aujourd'hui s'il a deja eu des actions, restent actifs."""
+    Chaque jour a la chance rest_day_chance, au moins rest_days_min par semaine, jamais deux jours de suite (ni
+    un lundi apres un dimanche de repos). Les jours deja passes au tirage, et aujourd'hui s'il a deja eu des
+    actions, restent actifs."""
     monday = week_start(day)
     key = f"rest_week:{monday.isoformat()}"
     stored = st.get_meta(key)
     if stored is not None:
         return [date.fromisoformat(d) for d in stored.split(",") if d]
+    days = [monday + timedelta(days=i) for i in range(7)]
+    open_days = [d for d in days if d > today() or (d == today() and not st.acted_on(d))]
     sunday = monday - timedelta(days=1)
     rest = [sunday] if sunday.isoformat() in (st.get_meta(f"rest_week:{week_start(sunday).isoformat()}") or "") else []
     rng = random.Random("repos-" + monday.isoformat())  # meme tirage si la base est recreee
-    for i in range(7):
-        d = monday + timedelta(days=i)
-        drawn = rng.random() < cfg["rest_day_chance"]
-        open_day = d > today() or (d == today() and not st.acted_on(d))
-        if drawn and open_day and d - timedelta(days=1) not in rest:
+    for d in days:
+        if rng.random() < cfg["rest_day_chance"] and d in open_days and d - timedelta(days=1) not in rest:
             rest.append(d)
+    # au moins rest_days_min jours, sauf si un jour deja passe sans action (PC eteint) en a tenu lieu
+    idle = any(d < today() and not st.acted_on(d) for d in days)
+    while not idle and sum(d >= monday for d in rest) < cfg["rest_days_min"]:
+        free = [d for d in open_days if not {d - timedelta(days=1), d, d + timedelta(days=1)} & set(rest)]
+        if not free:
+            break
+        rest = sorted(rest + [rng.choice(free)])
     rest = [d for d in rest if d >= monday]
     st.set_meta(key, ",".join(d.isoformat() for d in rest))
     log.info("Jours de repos tires pour la semaine du %s : %s", day_label(monday),

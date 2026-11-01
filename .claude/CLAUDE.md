@@ -63,9 +63,10 @@ bureau virtuel dedie.
   `profile_gap()`, pause de `profile_gap_seconds` (20 a 60 s) avant la page suivante, pour ne pas ouvrir plusieurs
   profils en quelques secondes.
 - Plage horaire `active_hours`, jours de repos planifies par semaine (`rest_days`, lundi a dimanche) : tires une
-  fois a la premiere demande de la semaine (`rest_day_chance` par jour, jamais deux de suite, ni un lundi apres un
-  dimanche de repos), gardes dans meta rest_week:<lundi>, puis fixes. Les jours deja passes au tirage, et
-  aujourd'hui s'il a deja eu des actions, restent actifs. Un jour actif PC eteint n'est pas rattrape.
+  fois a la premiere demande de la semaine (`rest_day_chance` par jour, au moins `rest_days_min` (1) par semaine,
+  jamais deux de suite, ni un lundi apres un dimanche de repos), gardes dans meta rest_week:<lundi>, puis fixes.
+  Les jours deja passes au tirage, et aujourd'hui s'il a deja eu des actions, restent actifs ; un jour deja passe
+  sans action (PC eteint) compte comme le repos minimum. Un jour actif PC eteint n'est pas rattrape.
 - Une seule source par passage, utilisee jusqu'au quota, en rotation dans l'ordre de seeds.txt (meta last_seed :
   le passage suivant part de la source d'apres). La source suivante n'est ouverte dans le meme passage que si
   celle-ci est epuisee ou inaccessible, `seeds_per_run` sources au plus.
