@@ -79,6 +79,18 @@ FOLLOWERS_HREF_SEL = 'a[href="/{}/followers/"]'
 FOLLOWERS_COUNT_RE = re.compile(r"^[\d\s.,]+\s*[A-Za-z]{0,3}\s*(followers?|abonné\(e\)s|abonnés?)$", re.I)
 DIALOG_SEL = 'div[role="dialog"]'
 ROW_LINK_SEL = 'a[href^="/"]'
+# Recherche (navigation interne d'Instagram, sans recharger la page, releve en novembre 2026) : le lien
+# "Recherche" de la barre de gauche ouvre /explore/ ; son champ est recouvert d'un bouton "Rechercher" qui lui
+# donne le focus ; les resultats sont des liens /pseudo/ dans <main>.
+SEARCH_NAV_SEL = ('a[href="/explore/"]:has(svg[aria-label="Recherche"]), '
+                  'a[href="/explore/"]:has(svg[aria-label="Search"])')
+SEARCH_INPUT_SEL = ('input[aria-label="Saisie de la recherche"], input[aria-label="Search input"], '
+                    'input[placeholder="Rechercher"], input[placeholder="Search"]')
+SEARCH_BAR_SEL = ('input[aria-label="Saisie de la recherche"] ~ div[role="button"], '
+                  'input[aria-label="Search input"] ~ div[role="button"], '
+                  'input[placeholder="Rechercher"] ~ div[role="button"], input[placeholder="Search"] ~ div[role="button"]')
+SEARCH_RESULT_SEL = 'main a[href="/{}/"]'
+PROFILE_LINK_SEL = 'a[href="/{}/"]:visible'  # ton propre profil : lien de la barre de gauche
 
 # Pour chaque bouton "Suivre" : pseudo de sa ligne (premier lien /pseudo/ trouve dans le plus
 # petit ancetre qui contient un lien). Si cet ancetre contient plusieurs boutons (ligne sans
@@ -147,6 +159,7 @@ DEFAULTS = {
     "explore_share": 0.2,
     "followback_scan_rows": 1000,
     "max_scrolls_per_seed": 80,
+    "pass_over_share": 0.25,  # part des comptes eligibles affiches passes sans abonnement (comme a la main)
     "virtual_desktop": 2,
     "browser_channel": "msedge",
     "locale": "fr-FR",
@@ -213,7 +226,9 @@ log = setup_log()
 
 
 def rnd(lo, hi):
-    return random.uniform(lo, hi)
+    """Duree au hasard : le plus souvent entre lo et hi (mediane au milieu), parfois plus longue (une fois sur
+    dix environ, jusqu'a lo + 3 x (hi - lo)), jamais moins que lo. Les delais humains ne sont pas uniformes."""
+    return lo + (hi - lo) * min(3.0, random.lognormvariate(math.log(0.5), 0.55))
 
 
 # ---------------------------------------------------------------------------
@@ -319,14 +334,19 @@ class State:
         """Comptes a desabonner : age >= delai propre au compte, sinon `days` (delai courant). Ceux qui t'ont
         suivi en retour sont gardes (kept). Les comptes deja en echec passent apres les autres (sinon trois
         echecs en tete de file bloquent chaque passage), ceux qui ont echoue MAX_UNFOLLOW_FAILS fois sont
-        abandonnes (given_up)."""
+        abandonnes (given_up). Les plus anciens sont choisis, puis l'ordre est melange (pas l'ordre des
+        abonnements, ni l'ordre alphabetique)."""
         rows = self.db.execute(
-            "SELECT username FROM users WHERE unfollowed_on IS NULL AND followed_back_on IS NULL "
-            "AND COALESCE(unfollow_fails, 0) < ? "
+            "SELECT username, COALESCE(unfollow_fails, 0) FROM users WHERE unfollowed_on IS NULL "
+            "AND followed_back_on IS NULL AND COALESCE(unfollow_fails, 0) < ? "
             "AND date(followed_on, '+' || COALESCE(fixed_days, ?) || ' days') <= ? "
-            "ORDER BY COALESCE(unfollow_fails, 0), followed_on, username LIMIT ?",
+            "ORDER BY COALESCE(unfollow_fails, 0), followed_on, followed_at LIMIT ?",
             (MAX_UNFOLLOW_FAILS, days, today().isoformat(), limit)).fetchall()
-        return [r[0] for r in rows]
+        fresh = [u for u, fails in rows if not fails]
+        failed = [u for u, fails in rows if fails]
+        random.shuffle(fresh)
+        random.shuffle(failed)
+        return fresh + failed
 
     def pending(self):
         """Comptes suivis depuis hier ou avant, toujours suivis, sans follow-back constate."""
@@ -575,7 +595,7 @@ def throttle(page, st, cfg, kind):
             log.info("Plafond horaire atteint et attente trop longue : arret pour aujourd'hui")
             return False
         log.info("Plafond horaire atteint (%d %s par heure) : attente de %d min", limit, kind, wait // 60)
-        page.wait_for_timeout(wait * 1000)
+        idle(page, wait, busy=False)
 
 
 def acquire_lock():
@@ -597,19 +617,44 @@ def acquire_lock():
 # ---------------------------------------------------------------------------
 # Navigateur
 # ---------------------------------------------------------------------------
+def work_area():
+    """Zone de l'ecran principal hors barre des taches (x, y, largeur, hauteur), ou None hors Windows."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        r = wintypes.RECT()
+        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(r), 0):  # SPI_GETWORKAREA
+            if r.right - r.left > 400 and r.bottom - r.top > 300:
+                return r.left, r.top, r.right - r.left, r.bottom - r.top
+    except Exception:
+        pass
+    return None
+
+
 def launch(p, cfg, hidden):
+    area = work_area()
+    w, h = (area[2], area[3]) if area else (1280, 900)  # taille d'une fenetre agrandie, comme a la main
     args = [
-        "--window-size=1280,900",
+        f"--window-size={w},{h}",
         # une fenetre cachee / sur un autre bureau ne doit pas etre ralentie
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
         "--disable-background-timer-throttling",
         "--disable-features=CalculateNativeWinOcclusion",
+        "--disable-blink-features=AutomationControlled",  # navigator.webdriver reste false
     ]
     if hidden:
-        args.append("--window-position=-32000,-32000")  # hors ecran jusqu'au placement
+        # hors ecran jusqu'au placement (place_on_bot_desktop), avant toute page d'Instagram
+        args.append("--window-position=-32000,-32000")
+    elif area:
+        args.append(f"--window-position={area[0]},{area[1]}")
     kw = dict(user_data_dir=str(PROFILE), headless=False, args=args, no_viewport=True,
-              locale=cfg["locale"], timezone_id=cfg["timezone"])
+              locale=cfg["locale"], timezone_id=cfg["timezone"],
+              # options de Playwright visibles par les pages : navigateur "controle par un logiciel de test"
+              # (navigator.webdriver = true, bandeau), aucune extension
+              ignore_default_args=["--enable-automation", "--disable-extensions"])
     channel = cfg.get("browser_channel")
     try:
         return p.chromium.launch_persistent_context(channel=channel, **kw)
@@ -637,20 +682,22 @@ def profile_pids():
 
 
 def place_on_bot_desktop(desktop_no):
-    """Windows : envoie la fenetre du navigateur sur le bureau virtuel dedie (cree si besoin).
-    Renvoie les identifiants des bureaux crees par cet appel, a passer a remove_desktops en fin de passage."""
+    """Windows : envoie la fenetre du navigateur sur le bureau virtuel dedie (cree si besoin), en haut a gauche
+    de l'ecran comme une fenetre agrandie. Sans bureau virtuel : derriere toutes les fenetres du bureau courant
+    (jamais hors ecran : une position a -32000 se lit depuis la page). Renvoie les identifiants des bureaux
+    crees par cet appel, a passer a remove_desktops en fin de passage."""
     created = []
     if os.name != "nt":
         return created
-    try:
-        import ctypes
-        from ctypes import wintypes
-        from pyvda import AppView, VirtualDesktop, get_virtual_desktops
-    except Exception as e:
-        log.warning("Bureau virtuel indisponible (%s) : la fenetre reste hors ecran", e)
-        return created
+    import ctypes
+    from ctypes import wintypes
 
     user32 = ctypes.windll.user32
+    x, y = (work_area() or (0, 0))[:2]
+
+    def put(hwnd, behind):  # NOSIZE | NOACTIVATE, et NOZORDER sauf pour passer derriere (HWND_BOTTOM)
+        user32.SetWindowPos(wintypes.HWND(hwnd), wintypes.HWND(1 if behind else 0), x, y, 0, 0,
+                            0x0001 | 0x0010 | (0 if behind else 0x0004))
     enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
 
     def find_hwnd():
@@ -682,6 +729,12 @@ def place_on_bot_desktop(desktop_no):
         log.warning("Fenetre du navigateur introuvable : elle reste hors ecran")
         return created
     try:
+        from pyvda import AppView, VirtualDesktop, get_virtual_desktops
+    except Exception as e:
+        log.warning("Bureau virtuel indisponible (%s) : fenetre derriere les autres sur le bureau courant", e)
+        put(hwnd, behind=True)
+        return created
+    try:
         total = len(get_virtual_desktops())
         while total < desktop_no:
             desktop = VirtualDesktop.create()
@@ -700,10 +753,11 @@ def place_on_bot_desktop(desktop_no):
         else:
             raise RuntimeError("deplacement refuse par Windows")
         # une fois sur l'autre bureau, on la remet a une position visible (invisible pour toi)
-        user32.SetWindowPos(wintypes.HWND(hwnd), wintypes.HWND(0), 60, 40, 0, 0,
-                            0x0001 | 0x0004 | 0x0010)  # NOSIZE | NOZORDER | NOACTIVATE
+        put(hwnd, behind=False)
     except Exception as e:
-        log.warning("Placement sur le bureau %d impossible (%s) : fenetre hors ecran", desktop_no, e)
+        log.warning("Placement sur le bureau %d impossible (%s) : fenetre derriere les autres sur le bureau "
+                    "courant", desktop_no, e)
+        put(hwnd, behind=True)
         return created
     log.info("Fenetre placee sur le bureau virtuel %d", desktop_no)
     return created
@@ -798,10 +852,11 @@ def logged_in(page):
     return page.locator(LOGGED_IN_SEL).count() > 0
 
 
-def human_pause(page, cfg, n, kind):
-    """Pause entre deux actions : etalee sur l'heure (3600 s / plafond horaire), avec variation."""
+def human_pause(page, cfg, kind):
+    """Pause entre deux actions : etalee sur l'heure (3600 s / plafond horaire), avec variation. Pause longue
+    au hasard (une fois sur long_pause_every en moyenne), pas a intervalle fixe."""
     secs = 3600 / cfg[f"max_{kind}s_per_hour"] * rnd(*cfg["pause_jitter"])
-    if n % cfg["long_pause_every"] == 0:
+    if random.random() < 1 / cfg["long_pause_every"]:
         secs += rnd(*cfg["long_pause_seconds"])
     capped_wait(page, cfg, secs)
 
@@ -816,14 +871,14 @@ def capped_wait(page, cfg, secs):
     deadline = cfg.get("_deadline")
     if deadline:  # inutile de dormir au-dela du temps de passage
         secs = min(secs, max(0.0, (deadline - now()).total_seconds()))
-    page.wait_for_timeout(secs * 1000)
+    idle(page, secs)
 
 
 # ---------------------------------------------------------------------------
 # Abonnements
 # ---------------------------------------------------------------------------
-def open_followers(page, seed):
-    page.goto(f"{IG}/{seed}/", wait_until="domcontentloaded")
+def open_followers(page, seed, own=False):
+    open_profile(page, seed, own)
     page.wait_for_timeout(rnd(2500, 4000))
     dismiss_popups(page)
     try:
@@ -841,7 +896,7 @@ def open_followers(page, seed):
 
 
 # ---------------------------------------------------------------------------
-# Souris : trajectoires courbes, molette, clics
+# Souris et clavier : trajectoires courbes, molette, clics, saisie, gestes pendant les pauses
 # ---------------------------------------------------------------------------
 _mouse_pos = {}  # derniere position du curseur, par page (tenue a jour par human_move)
 
@@ -975,6 +1030,20 @@ JS_VIEW_BOX = r"""el => {
 
 # Le point (x, y) tombe-t-il sur l'element (ou sur le bouton / lien qui le contient), et pas sur
 # quelque chose pose par-dessus ?
+JS_IN_VIEW = r"""els => els.map(el => {  // entierement visible dans sa liste (ou la page) ?
+  const r = el.getBoundingClientRect();
+  let top = 0, bottom = innerHeight;
+  for (let p = el.parentElement; p && p !== document.body && p !== document.documentElement; p = p.parentElement) {
+    const o = getComputedStyle(p).overflowY;
+    if ((o === 'auto' || o === 'scroll') && p.scrollHeight > p.clientHeight) {
+      const b = p.getBoundingClientRect();
+      top = Math.max(0, b.top); bottom = Math.min(innerHeight, b.bottom);
+      break;
+    }
+  }
+  return r.height > 0 && r.top >= top && r.bottom <= bottom;
+})"""
+
 JS_HIT = r"""(el, [x, y]) => {
   const t = document.elementFromPoint(x, y);
   const owner = el.closest('button, a, [role="button"], [role="link"], [role="menuitem"]') || el;
@@ -1049,8 +1118,145 @@ def human_click(page, locator, timeout=8000):
             pass
 
 
-def follow_from_seed(page, seed, quota, st, cfg, counter, fixed_days=lambda: None):
-    """Suit jusqu'a `quota` abonnes de `seed`. Retourne (nombre, 'ok' | 'skip' | 'stop' | 'blocked')."""
+_AZERTY = ("1234567890", "azertyuiop", "qsdfghjklm", "wxcvbn")  # clavier de la locale fr-FR
+
+
+def _neighbor(ch):
+    """Touche voisine de `ch` sur un clavier AZERTY (rangees decalees), None pour . et _ (pas de faute simulee)."""
+    for r, row in enumerate(_AZERTY):
+        c = row.find(ch)
+        if c < 0:
+            continue
+        around = [(r, c - 1), (r, c + 1)]
+        if r > 0:
+            around += [(r - 1, c), (r - 1, c + 1)]
+        if r < len(_AZERTY) - 1:
+            around += [(r + 1, c - 1), (r + 1, c)]
+        keys = [_AZERTY[i][j] for i, j in around if 0 <= j < len(_AZERTY[i])]
+        return random.choice(keys) if keys else None
+    return None
+
+
+def _key(page, ch, speed):
+    page.keyboard.press(ch, delay=random.uniform(35, 110))  # touche tenue quelques dizaines de ms
+    gap = random.lognormvariate(math.log(150 * speed), 0.35)
+    if ch.isdigit():
+        gap += random.uniform(40, 140)  # chiffres en Maj sur un clavier AZERTY
+    if random.random() < 0.08:
+        gap += random.uniform(300, 900)  # hesitation
+    page.wait_for_timeout(gap)
+
+
+def human_type(page, text, stop_when=None):
+    """Tape `text` touche par touche, a un rythme irregulier, avec de temps en temps une faute (touche voisine ou
+    lettre doublee) remarquee tout de suite ou une ou deux lettres plus loin, puis effacee avec la touche
+    retour arriere. stop_when(n) vrai : arret apres n caracteres justes (le resultat voulu est deja affiche)."""
+    speed = random.uniform(0.8, 1.3)  # rythme propre a cette saisie
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        slip = None
+        if random.random() < 0.045:
+            slip = "double" if random.random() < 0.25 else _neighbor(ch)
+        if slip:
+            extra = text[i + 1:i + 1 + random.choices((0, 1, 2), weights=(55, 33, 12))[0]]
+            typed = (ch + ch if slip == "double" else slip) + extra
+            for c in typed:
+                _key(page, c, speed)
+            page.wait_for_timeout(random.uniform(250, 800))  # le temps de voir la faute
+            for _ in range(len(typed) - (1 if slip == "double" else 0)):
+                page.keyboard.press("Backspace", delay=random.uniform(30, 80))
+                page.wait_for_timeout(random.uniform(70, 160))
+            if slip == "double":
+                i += 1
+            continue
+        _key(page, ch, speed)
+        i += 1
+        if stop_when and i >= 3 and i < len(text) and stop_when(i):
+            return
+
+
+def _search_profile(page, user):
+    """Recherche : lien de la barre de gauche, clic dans le champ, pseudo tape au clavier, clic sur le resultat."""
+    inp = page.locator(SEARCH_INPUT_SEL).first
+    if not inp.is_visible():
+        human_click(page, page.locator(SEARCH_NAV_SEL).first)
+        inp.wait_for(state="visible", timeout=10000)
+        page.wait_for_timeout(rnd(600, 1400))
+    bar = page.locator(SEARCH_BAR_SEL).first
+    human_click(page, bar if bar.is_visible() else inp, timeout=5000)
+    page.wait_for_timeout(rnd(250, 600))
+    if not inp.evaluate("e => e === document.activeElement"):
+        raise PWTimeout("champ de recherche sans focus")
+    if inp.input_value():  # recherche precedente encore affichee : tout selectionner, effacer
+        page.keyboard.press("Control+a", delay=random.uniform(40, 90))
+        page.wait_for_timeout(rnd(120, 300))
+        page.keyboard.press("Backspace", delay=random.uniform(30, 80))
+        page.wait_for_timeout(rnd(200, 500))
+    result = page.locator(SEARCH_RESULT_SEL.format(user)).first
+    # on s'arrete parfois des que le compte apparait dans la liste, comme a la main
+    human_type(page, user, lambda n: n >= max(3, len(user) // 2) and random.random() < 0.5 and result.is_visible())
+    result.wait_for(state="visible", timeout=8000)
+    page.wait_for_timeout(rnd(400, 1200))  # le temps de lire les resultats
+    human_click(page, result)
+
+
+def open_profile(page, user, own=False):
+    """Ouvre un profil comme a la main, sans recharger la page : le tien par le lien de la barre de gauche, un
+    autre par la Recherche. Repli sur l'adresse du profil si ca echoue (compte introuvable ou renomme,
+    interface changee). Leve PWTimeout si meme l'adresse ne charge pas."""
+    try:
+        if own:
+            human_click(page, page.locator(PROFILE_LINK_SEL.format(user)).first, timeout=5000)
+        else:
+            _search_profile(page, user)
+        page.wait_for_url(re.compile(rf"/{re.escape(user)}/?(\?.*)?$"), timeout=15000)
+        page.locator("header").first.wait_for(state="visible", timeout=15000)
+        return
+    except PWTimeout as e:
+        log.info("@%s : profil non ouvert par %s (%s), ouverture par son adresse", user,
+                 "le lien de ton profil" if own else "la recherche", str(e).splitlines()[0][:100])
+    page.goto(f"{IG}/{user}/", wait_until="domcontentloaded")
+
+
+def _fidget(page):
+    """Petit geste sans clic : le curseur se deplace un peu, ou la molette fait defiler un peu."""
+    w, h = _viewport(page)
+    x, y = _mouse_pos.get(id(page), (w / 2, h / 2))
+    r = random.random()
+    if r < 0.7:
+        human_move(page, min(max(x + random.gauss(0, 90), 10), w - 10), min(max(y + random.gauss(0, 70), 10), h - 10))
+    else:
+        if not _mouse_pos.get(id(page)):
+            human_move(page, x, y)
+        dist = random.uniform(100, 400) * (1 if random.random() < 0.6 else -1)
+        _wheel_gesture(page, dist)
+
+
+def idle(page, secs, busy=True):
+    """Attente avec de petits gestes de temps en temps (curseur, molette), comme quelqu'un qui lit ou regarde
+    ailleurs, au lieu d'une page figee pendant des minutes puis un clic. busy=False (longues attentes de
+    plafond) : gestes plus rares, absences plus longues."""
+    end = time.monotonic() + secs
+    median, away = (15, 0.12) if busy else (60, 0.3)
+    while True:
+        left = end - time.monotonic()
+        if left <= 0:
+            return
+        gap = random.lognormvariate(math.log(median), 0.8)
+        if random.random() < away:
+            gap += random.uniform(45, 240)  # absent un moment
+        if gap >= left:
+            page.wait_for_timeout(left * 1000)
+            return
+        page.wait_for_timeout(gap * 1000)
+        _fidget(page)
+
+
+def follow_from_seed(page, seed, quota, st, cfg, fixed_days=lambda: None):
+    """Suit jusqu'a `quota` abonnes de `seed`. Comme a la main : un compte au hasard parmi ceux affiches (pas
+    toujours le premier de la liste), et une part (pass_over_share) est passee sans abonnement.
+    Retourne (nombre, 'ok' | 'skip' | 'stop' | 'blocked')."""
     try:
         dlg = open_followers(page, seed)
     except PWTimeout:  # profil de la source trop lent a charger
@@ -1065,8 +1271,8 @@ def follow_from_seed(page, seed, quota, st, cfg, counter, fixed_days=lambda: Non
         while done < quota and scrolls <= cfg["max_scrolls_per_seed"]:
             btns = dlg.get_by_role("button", name=FOLLOW_RE)
             users = btns.evaluate_all(JS_USERS)
-            idx = next((i for i, u in enumerate(users) if u and u not in skip and not st.known(u)), None)
-            if idx is None:  # rien d'eligible a l'ecran : on descend dans la liste
+            cands = [i for i, u in enumerate(users) if u and u not in skip and not st.known(u)]
+            if not cands:  # rien d'eligible a l'ecran : on descend dans la liste
                 before = dlg.locator(ROW_LINK_SEL).count()
                 scroll_dialog(page, dlg)
                 scrolls += 1
@@ -1074,7 +1280,14 @@ def follow_from_seed(page, seed, quota, st, cfg, counter, fixed_days=lambda: Non
                 if stalls >= 3:  # fin de liste
                     break
                 continue
+            shown = btns.evaluate_all(JS_IN_VIEW)
+            visible = [i for i in cands if i < len(shown) and shown[i]]
+            idx = random.choice(visible) if visible else cands[0]
             user = users[idx]
+            if random.random() < cfg["pass_over_share"]:  # passe sans s'abonner, le temps de lire la ligne
+                skip.add(user)
+                page.wait_for_timeout(rnd(300, 1200))
+                continue
             if not throttle(page, st, cfg, "follow"):
                 return done, "stop"
             try:
@@ -1098,9 +1311,8 @@ def follow_from_seed(page, seed, quota, st, cfg, counter, fixed_days=lambda: Non
             fails = 0
             st.add_follow(user, fixed_days())
             done += 1
-            counter[0] += 1
             log.info("[%s] abonne a @%s (%d/%d)", seed, user, done, quota)
-            human_pause(page, cfg, counter[0], "follow")
+            human_pause(page, cfg, "follow")
     except PWTimeout as e:  # liste disparue ou page figee : on passe a la source suivante
         log.warning("[%s] liste d'abonnes interrompue (%s)", seed, str(e).splitlines()[0][:120])
         shot(page, cfg, f"followers-{seed}-error")
@@ -1115,6 +1327,44 @@ def follow_registered(page, dlg, user):
             return True
         page.wait_for_timeout(2000)
     return user not in dlg.get_by_role("button", name=FOLLOW_RE).evaluate_all(JS_USERS)
+
+
+def follow_phase(page, pool, want, st, cfg, fixed_days):
+    """Abonnements d'une phase du passage. `pool` : sources restantes du passage, la premiere est celle en cours ;
+    une source epuisee ou inaccessible en est retiree, et la suivante n'est ouverte qu'alors. Une source pas
+    epuisee reste en tete pour la phase suivante. Retourne (nombre, 'ok' | 'stop' | 'blocked')."""
+    done = 0
+    while done < want and pool:
+        seed = pool[0]
+        n, s = follow_from_seed(page, seed, want - done, st, cfg, fixed_days)
+        if s == "skip":  # source inaccessible : ecartee apres 3 echecs
+            st.set_meta(f"seed_fail:{seed}", str(int(st.get_meta(f"seed_fail:{seed}") or 0) + 1))
+            pool.pop(0)
+            profile_gap(page, cfg)
+            continue
+        st.set_meta(f"seed_fail:{seed}", "0")
+        st.set_meta("last_seed", seed)
+        done += n
+        if s in ("blocked", "stop"):
+            return done, s
+        if done < want:
+            log.info("[%s] plus de compte a suivre : source suivante", seed)
+            pool.pop(0)
+    return done, "ok"
+
+
+def task_order(quota):
+    """Ordre des taches du passage, tire au hasard pour ne pas toujours suivre la meme sequence. La lecture de
+    tes abonnes reste avant les desabonnements (un follow-back du jour ne doit pas etre desabonne). Les
+    abonnements faits avant les desabonnements restent peu nombreux (2 a 5) : les desabonnements gardent la
+    priorite sur le temps de passage. Liste de (tache, nombre d'abonnements pour 'follow')."""
+    early = min(quota, random.randint(2, 5))
+    r = random.random()
+    if r < 0.4 or not early:
+        return [("scan", 0), ("unfollow", 0), ("follow", quota)]
+    if r < 0.7:
+        return [("follow", early), ("scan", 0), ("unfollow", 0), ("follow", quota - early)]
+    return [("scan", 0), ("follow", early), ("unfollow", 0), ("follow", quota - early)]
 
 
 def seed_rotation(seeds, last):
@@ -1137,7 +1387,7 @@ def scan_my_followers(page, me, st, cfg):
     cap = cfg["followback_scan_rows"]
     seen, stalls, scrolls = set(), 0, 0
     try:
-        dlg = open_followers(page, me)
+        dlg = open_followers(page, me, own=True)
         if dlg is None:
             log.warning("Liste de tes abonnes inaccessible (pseudo '%s' correct ?) : mesure du jour ignoree", me)
             shot(page, cfg, "scan-followers")
@@ -1178,7 +1428,7 @@ def scan_my_followers(page, me, st, cfg):
 def unfollow_one(page, user, cfg):
     """Retourne 'ok' | 'already' (deja plus suivi) | 'gone' | 'noload' (page vide) | 'failed' | 'blocked'.
     Leve PWTimeout si la page ne charge pas (traite comme 'noload' par unfollow_pass)."""
-    page.goto(f"{IG}/{user}/", wait_until="domcontentloaded")
+    open_profile(page, user)
     page.wait_for_timeout(rnd(2500, 4000))
     dismiss_popups(page)
     if blocked(page):
@@ -1216,7 +1466,7 @@ def unfollow_one(page, user, cfg):
         return "failed"
 
 
-def unfollow_pass(page, st, cfg, counter, days):
+def unfollow_pass(page, st, cfg, days):
     """Retourne (nombre, 'ok' | 'stop' | 'slow' | 'blocked' | 'broken').
     Un compte en echec passe en fin de file (abandonne apres MAX_UNFOLLOW_FAILS echecs). Trois echecs
     d'interface de suite arretent le passage ('broken'), trois pages non chargees de suite aussi ('slow')."""
@@ -1240,8 +1490,7 @@ def unfollow_pass(page, st, cfg, counter, days):
             log.info("desabonne de @%s%s", user, f" ({notes[res]})" if notes[res] else "")
             if res == "ok":
                 done += 1
-                counter[0] += 1
-                human_pause(page, cfg, counter[0], "unfollow")
+                human_pause(page, cfg, "unfollow")
             else:  # aucun clic : pas de pause longue, mais pas de rafale de profils non plus
                 profile_gap(page, cfg)
             continue
@@ -1454,7 +1703,7 @@ def cmd_check_seeds(cfg, here):
                 log.error("Session Instagram absente ou expiree : relance 'insta_rotate.py login'")
                 return 3
             for seed in cfg["seeds"]:
-                page.goto(f"{IG}/{seed}/", wait_until="domcontentloaded")
+                open_profile(page, seed)
                 page.wait_for_timeout(rnd(4000, 8000))
                 dismiss_popups(page)
                 if blocked(page):
@@ -1535,7 +1784,6 @@ def cmd_run(cfg, here, force=False):
     def fixed_days():  # groupe temoin : une part des comptes reste suivie le delai le plus long
         return longest if analysis and random.random() < cfg["explore_share"] else None
 
-    counter = [0]
     unfollows = follows = 0
     status, kind, pause = "ok", None, None
     error = "interrompu"  # remplace quand le passage va au bout ou leve une erreur
@@ -1572,44 +1820,45 @@ def cmd_run(cfg, here, force=False):
                 ready = now()
                 left = minutes_left(st, cfg)
                 cfg["_deadline"] = ready + timedelta(minutes=left) if left is not None else None
-                if analysis:
-                    if st.get_meta("last_scan_on") != today().isoformat():  # une lecture par jour
-                        scan = scan_my_followers(page, cfg["username"], st, cfg)[0]
-                        if scan == "ok":
-                            st.set_meta("last_scan_on", today().isoformat())
-                        elif scan == "blocked":
-                            status = "blocked"
-                    stats = followback_stats(st.samples(cfg["adapt_window_days"]), cfg, base)
-                    log.info("Follow-back : %s", describe(stats))
-                    if stats["delay"] != days:
-                        log.info("Delai de desabonnement ajuste : %d -> %d jours", days, stats["delay"])
-                    days = stats["delay"]
-                    st.set_meta("current_days", str(days))
-                if status == "ok" and room and st.due(days, 1):
-                    unfollows, status = unfollow_pass(page, st, cfg, counter, days)
-                if status == "ok" and quota:
-                    remaining = quota
-                    # une seule source par passage, utilisee jusqu'au quota ; la suivante n'est ouverte que
-                    # si celle-ci est epuisee ou inaccessible (seeds_per_run sources au plus)
-                    pool = [s for s in seed_rotation(cfg["seeds"], st.get_meta("last_seed")) if s in alive]
-                    for seed in pool[:cfg["seeds_per_run"]]:
-                        n, s = follow_from_seed(page, seed, remaining, st, cfg, counter, fixed_days)
-                        if s == "skip":  # source inaccessible : ecartee apres 3 echecs
-                            st.set_meta(f"seed_fail:{seed}", str(int(st.get_meta(f"seed_fail:{seed}") or 0) + 1))
-                            profile_gap(page, cfg)
-                            continue
-                        st.set_meta(f"seed_fail:{seed}", "0")
-                        st.set_meta("last_seed", seed)
-                        follows += n
-                        remaining -= n
-                        if s in ("blocked", "stop"):
-                            status = s
-                            break
-                        if remaining <= 0:
-                            break
-                        log.info("[%s] plus de compte a suivre : source suivante", seed)
-                    if status == "ok" and remaining > 0:
-                        log.info("Quota non atteint : il manque %d abonnement(s)", remaining)
+                # une seule source par passage, utilisee jusqu'au quota ; la suivante n'est ouverte que si
+                # celle-ci est epuisee ou inaccessible (seeds_per_run sources au plus)
+                pool = [s for s in seed_rotation(cfg["seeds"], st.get_meta("last_seed")) if s in alive]
+                pool = pool[:cfg["seeds_per_run"]]
+                remaining = quota
+                follow_cap = False
+                order = task_order(quota)
+                log.info("Ordre du passage : %s", ", ".join(f"{t} {n}" if t == "follow" else t for t, n in order))
+                for task, n in order:
+                    if status != "ok":
+                        break
+                    if task == "scan" and analysis:
+                        if st.get_meta("last_scan_on") != today().isoformat():  # une lecture par jour
+                            scan = scan_my_followers(page, cfg["username"], st, cfg)[0]
+                            if scan == "ok":
+                                st.set_meta("last_scan_on", today().isoformat())
+                            elif scan == "blocked":
+                                status = "blocked"
+                        stats = followback_stats(st.samples(cfg["adapt_window_days"]), cfg, base)
+                        log.info("Follow-back : %s", describe(stats))
+                        if stats["delay"] != days:
+                            log.info("Delai de desabonnement ajuste : %d -> %d jours", days, stats["delay"])
+                        days = stats["delay"]
+                        st.set_meta("current_days", str(days))
+                    elif task == "unfollow" and room and st.due(days, 1):
+                        unfollows, status = unfollow_pass(page, st, cfg, days)
+                    elif task == "follow" and not follow_cap and min(n, remaining) > 0:
+                        got, status = follow_phase(page, pool, min(n, remaining), st, cfg, fixed_days)
+                        follows += got
+                        remaining -= got
+                        deadline = cfg["_deadline"]
+                        if status == "stop" and in_active_hours(cfg, now()) and not (deadline and now() >= deadline):
+                            # plafond horaire des abonnements : les desabonnements de la suite du passage restent
+                            # possibles, plus d'abonnement dans ce passage
+                            follow_cap, status = True, "ok"
+                if follow_cap and status == "ok":
+                    status = "stop"
+                if status == "ok" and quota and remaining > 0:
+                    log.info("Quota non atteint : il manque %d abonnement(s)", remaining)
                 if status == "blocked":
                     kind = block_kind(page) or "limit"
             finally:

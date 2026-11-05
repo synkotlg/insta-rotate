@@ -7,7 +7,9 @@ description: Diagnostiquer et corriger insta_rotate.py quand l'interface web d'I
 
 1. Lire la fin de `data/log.txt` et reperer l'etape qui echoue : ouverture d'une liste d'abonnes (celle d'une source
    ou la tienne pour la mesure des follow-back), clic sur Suivre, desabonnement, detection d'une reaction d'Instagram,
-   ou verification de connexion.
+   verification de connexion, ou ouverture d'un profil par la recherche ("profil non ouvert par la recherche" pour
+   presque chaque compte, y compris ceux qui existent : selecteurs SEARCH_* ou PROFILE_LINK_SEL). Beaucoup de
+   "Clic de repli" : un element recouvert par un autre (comme le champ de recherche, recouvert par son bouton).
 2. Regarder les captures les plus recentes dans `data/debug/` (nom = date + etape).
 3. Relancer en visible pour observer : `.\.venv\Scripts\python.exe insta_rotate.py run --here --force`
    (baisser temporairement `follows_per_day` a 2 dans config.json pour un test court). Si une seule source echoue,

@@ -64,6 +64,25 @@ bureau virtuel dedie.
   `scroll_dialog`. Ne pas revenir a `locator.click()` (curseur teleporte au centre, clic instantane) ; `_mouse_pos`
   doit toujours suivre le curseur, sinon il saute au mouvement suivant. Repli sur le clic de Playwright ("Clic de
   repli" dans log.txt) si l'element reste hors de vue ou est recouvert ; un element disparu leve PWTimeout.
+- Navigation : jamais d'adresse tapee pour un profil (`open_profile`) : ton profil par le lien de la barre de gauche,
+  les autres par la Recherche (`_search_profile` : lien Recherche, clic dans le champ, pseudo tape par `human_type`,
+  clic sur le resultat), sans recharger la page. `human_type` : rythme irregulier, fautes de frappe (touche voisine
+  AZERTY ou lettre doublee) effacees au retour arriere, arret possible des que le compte apparait. Repli sur
+  `page.goto` (log "profil non ouvert par la recherche") si le compte n'apparait pas (supprime, renomme) ou si
+  l'interface a change. Seul l'accueil (`logged_in`) s'ouvre par son adresse.
+- Pauses jamais figees : `capped_wait` et les attentes de `throttle` passent par `idle` (petits gestes au hasard,
+  curseur ou molette, sans clic, avec des absences). `rnd(lo, hi)` : jamais moins que lo, mediane au milieu, une
+  fois sur dix plus long (jusqu'a lo + 3 x (hi - lo)) ; pause longue au hasard (1 sur `long_pause_every` en
+  moyenne), pas toutes les N actions.
+- Abonnements : un compte au hasard parmi les eligibles affiches (pas le premier de la liste), `pass_over_share`
+  (25 %) passes sans abonnement. Desabonnements (`due`) : les plus anciens, dans un ordre melange (jamais
+  alphabetique), ceux en echec en dernier.
+- Ordre du passage tire au hasard (`task_order`) : lecture de tes abonnes toujours avant les desabonnements ; parfois
+  2 a 5 abonnements avant (au debut ou apres la lecture), le reste apres. Si ces premiers abonnements butent sur le
+  plafond horaire, les desabonnements continuent quand meme (plus d'abonnement dans ce passage).
+- Navigateur (`launch`) : sans `--enable-automation` (navigator.webdriver = true, bandeau) ni `--disable-extensions`,
+  avec `--disable-blink-features=AutomationControlled`. Ne pas les remettre. Fenetre de la taille de l'ecran (zone de
+  travail), en haut a gauche ; jamais laissee a -32000 (position lisible depuis la page).
 - Profil ouvert sans clic (deja plus suivi, introuvable, echec, page non chargee) ou source inaccessible :
   `profile_gap()`, pause de `profile_gap_seconds` (20 a 60 s) avant la page suivante, pour ne pas ouvrir plusieurs
   profils en quelques secondes.
@@ -86,7 +105,8 @@ bureau virtuel dedie.
 - `daily_minutes` (180 par defaut, 0 = illimite) : temps de passage maximal par jour, cumule sur tous les passages
   (meta run_seconds:<date>), compte a partir de la connexion a Instagram (le demarrage n'est pas decompte). Le
   passage s'arrete proprement a l'echeance (`cfg["_deadline"]`, lue par `throttle` et
-  `human_pause`) ; les desabonnements passent avant les abonnements. Le travail non fait n'est pas rattrape (pas de rafale).
+  `human_pause`) ; les desabonnements passent avant les abonnements (sauf 2 a 5 abonnements dans certains passages,
+  voir `task_order`). Le travail non fait n'est pas rattrape (pas de rafale).
 - A rythme prudent : environ max_follows_per_hour abonnements ou max_unfollows_per_hour desabonnements par heure de PC
   allume. Le volume du jour est donc fixe par le temps disponible, pas par follows_per_day.
 - `keep_awake` : empeche la mise en veille Windows pendant le passage (SetThreadExecutionState).
@@ -121,7 +141,8 @@ bureau virtuel dedie.
 ## Points d'attention
 - Les pseudos de seeds.txt ont ete ecrits de memoire : `check-seeds` avant la premiere vraie passe.
 - Le placement sur bureau virtuel passe par pyvda (API COM interne de Windows) : peut casser apres une mise a jour
-  de Windows. Repli automatique : fenetre hors ecran sur le bureau courant.
+  de Windows. Repli automatique : fenetre derriere toutes les autres sur le bureau courant
+  (visible seulement si rien d'autre n'est ouvert).
 - Un bureau cree par un passage (run, check-seeds) est supprime a la fin de ce passage, navigateur ferme
   (`remove_desktops`), sauf s'il y reste une fenetre. Un bureau deja present n'est jamais supprime : si tu as
   deja `virtual_desktop` bureaux, la fenetre va sur le tien.
