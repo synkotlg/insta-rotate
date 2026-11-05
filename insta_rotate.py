@@ -17,6 +17,7 @@ import argparse
 import atexit
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -28,10 +29,6 @@ from datetime import date, datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from zoneinfo import ZoneInfo
-
-import math
-
-_mouse_pos = {}
 
 import psutil
 from playwright.sync_api import Error as PWError
@@ -745,7 +742,7 @@ def dismiss_popups(page):
         try:
             btn = page.get_by_role("button", name=rx).first
             if btn.is_visible():
-                btn.click(timeout=3000)
+                human_click(page, btn, timeout=3000)
                 page.wait_for_timeout(800)
         except Exception:
             pass
@@ -830,8 +827,8 @@ def open_followers(page, seed):
     page.wait_for_timeout(rnd(2500, 4000))
     dismiss_popups(page)
     try:
-        page.locator(FOLLOWERS_HREF_SEL.format(seed)).or_(
-            page.get_by_role("link", name=FOLLOWERS_COUNT_RE)).first.click(timeout=8000)
+        human_click(page, page.locator(FOLLOWERS_HREF_SEL.format(seed)).or_(
+            page.get_by_role("link", name=FOLLOWERS_COUNT_RE)).first)
     except PWTimeout:
         page.goto(f"{IG}/{seed}/followers/", wait_until="domcontentloaded")
     dlg = page.locator(DIALOG_SEL).last
@@ -841,6 +838,13 @@ def open_followers(page, seed):
         return None
     page.wait_for_timeout(rnd(1500, 2500))
     return dlg
+
+
+# ---------------------------------------------------------------------------
+# Souris : trajectoires courbes, molette, clics
+# ---------------------------------------------------------------------------
+_mouse_pos = {}  # derniere position du curseur, par page (tenue a jour par human_move)
+
 
 def _ease_in_out(t):
     return 0.5 - math.cos(math.pi * t) / 2
@@ -869,8 +873,18 @@ def _curve(page, start, end):
         page.mouse.move(max(0, x + random.gauss(0, shake)), max(0, y + random.gauss(0, shake)))
         page.wait_for_timeout(random.uniform(6, 18))
 
+def _viewport(page):
+    try:
+        return tuple(page.evaluate("() => [innerWidth, innerHeight]"))
+    except PWError:
+        return 1280, 800
+
+
 def human_move(page, x, y):
-    start = _mouse_pos.get(id(page), (0, 0))
+    start = _mouse_pos.get(id(page))
+    if start is None:  # premier mouvement : depuis un point quelconque de la fenetre, pas depuis le coin (0, 0)
+        w, h = _viewport(page)
+        start = (w * random.uniform(0.2, 0.8), h * random.uniform(0.2, 0.8))
     dist = math.hypot(x - start[0], y - start[1])
     if dist > 150 and random.random() < 0.15:
         over = random.uniform(6, 22)
@@ -941,6 +955,100 @@ def scroll_dialog(page, dlg):
         page.wait_for_timeout(pause)
 
 
+# Position de l'element et zone visible de son plus proche ancetre defilable (liste d'une fenetre, sinon la
+# page), en pixels de la fenetre. null si l'element n'est plus dans la page. DOM generique, pas Instagram.
+JS_VIEW_BOX = r"""el => {
+  if (!el.isConnected) return null;
+  const r = el.getBoundingClientRect();
+  let c = {ctop: 0, cbottom: innerHeight, cleft: 0, cright: innerWidth};
+  for (let p = el.parentElement; p && p !== document.body && p !== document.documentElement; p = p.parentElement) {
+    const o = getComputedStyle(p).overflowY;
+    if ((o === 'auto' || o === 'scroll') && p.scrollHeight > p.clientHeight) {
+      const b = p.getBoundingClientRect();
+      c = {ctop: Math.max(0, b.top), cbottom: Math.min(innerHeight, b.bottom),
+           cleft: Math.max(0, b.left), cright: Math.min(innerWidth, b.right)};
+      break;
+    }
+  }
+  return Object.assign({top: r.top, bottom: r.bottom, height: r.height}, c);
+}"""
+
+# Le point (x, y) tombe-t-il sur l'element (ou sur le bouton / lien qui le contient), et pas sur
+# quelque chose pose par-dessus ?
+JS_HIT = r"""(el, [x, y]) => {
+  const t = document.elementFromPoint(x, y);
+  const owner = el.closest('button, a, [role="button"], [role="link"], [role="menuitem"]') || el;
+  return !!t && (owner === t || owner.contains(t));
+}"""
+
+
+def _bring_into_view(page, el):
+    """Amene l'element dans la zone visible de sa liste (ou de la page) a la molette, curseur sur la zone,
+    au lieu du defilement instantane de Playwright. False si l'element a disparu ou reste hors de vue."""
+    for _ in range(4):
+        v = el.evaluate(JS_VIEW_BOX)
+        if v is None or v["cbottom"] - v["ctop"] < 40 or v["cright"] - v["cleft"] < 40:
+            return False
+        if v["top"] >= v["ctop"] and v["bottom"] <= v["cbottom"]:
+            return True
+        inset = min(max(0.0, (v["cbottom"] - v["ctop"] - v["height"]) / 2), random.uniform(40, 140))
+        if v["top"] < v["ctop"]:
+            delta = v["top"] - v["ctop"] - inset
+        else:
+            delta = v["bottom"] - v["cbottom"] + inset
+        area = {"x": v["cleft"], "y": v["ctop"], "width": v["cright"] - v["cleft"],
+                "height": v["cbottom"] - v["ctop"]}
+        if not _inside(_mouse_pos.get(id(page)), area, margin=20):
+            human_move(page, area["x"] + area["width"] * random.uniform(0.3, 0.7),
+                       area["y"] + area["height"] * random.uniform(0.3, 0.7))
+        _wheel_gesture(page, delta)
+        page.wait_for_timeout(random.uniform(300, 650))  # fin du defilement anime avant de remesurer
+    return False
+
+
+def human_click(page, locator, timeout=8000):
+    """Clic comme a la main : molette jusqu'a l'element, trajectoire courbe vers un point au hasard du
+    bouton (pas son centre exact), courte pause, appui puis relache espaces. Repli sur le clic de Playwright
+    si l'element reste hors de vue ou est masque. Leve PWTimeout si l'element n'apparait pas a temps ou
+    disparait (liste redessinee) ; un navigateur ferme leve l'erreur d'origine."""
+    locator.wait_for(state="visible", timeout=timeout)
+    el = locator.element_handle(timeout=timeout)  # meme element tout du long, meme si la liste bouge
+    try:
+        if _bring_into_view(page, el):
+            for _ in range(2):  # un second essai si l'element a bouge ou etait recouvert
+                box = el.bounding_box()
+                if not box:
+                    break
+                x = box["x"] + box["width"] * min(0.8, max(0.2, random.gauss(0.5, 0.13)))
+                y = box["y"] + box["height"] * min(0.75, max(0.25, random.gauss(0.5, 0.12)))
+                human_move(page, x, y)
+                page.wait_for_timeout(random.uniform(80, 320))
+                if el.evaluate(JS_HIT, [x, y]):
+                    page.mouse.down()
+                    page.wait_for_timeout(random.uniform(55, 140))
+                    page.mouse.up()
+                    return
+        log.info("Clic de repli (element hors de vue, recouvert ou disparu)")
+        el.click(timeout=timeout)
+        try:  # le clic de Playwright laisse le curseur au centre de l'element
+            box = el.bounding_box()
+        except PWError:
+            box = None
+        if box:
+            _mouse_pos[id(page)] = (box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    except PWTimeout:
+        raise
+    except PWError as e:
+        if page.is_closed() or "closed" in str(e).lower():
+            raise
+        raise PWTimeout(f"clic impossible, element disparu ({str(e).splitlines()[0][:120]})") from e
+    finally:
+        try:
+            el.dispose()
+        except PWError:
+            pass
+
+
 def follow_from_seed(page, seed, quota, st, cfg, counter, fixed_days=lambda: None):
     """Suit jusqu'a `quota` abonnes de `seed`. Retourne (nombre, 'ok' | 'skip' | 'stop' | 'blocked')."""
     try:
@@ -970,7 +1078,7 @@ def follow_from_seed(page, seed, quota, st, cfg, counter, fixed_days=lambda: Non
             if not throttle(page, st, cfg, "follow"):
                 return done, "stop"
             try:
-                btns.nth(idx).click(timeout=8000)
+                human_click(page, btns.nth(idx))
             except PWTimeout:
                 skip.add(user)
                 continue
@@ -1087,14 +1195,14 @@ def unfollow_one(page, user, cfg):
     if btn.count() == 0:
         shot(page, cfg, f"unfollow-{user}-nobutton")
         return "failed"
-    btn.click(timeout=8000)
+    human_click(page, btn)
     page.wait_for_timeout(rnd(1000, 1800))
     for _ in range(2):  # menu, puis eventuelle confirmation
         item = page.get_by_text(UNFOLLOW_RE).last
         if not item.is_visible():
             break
         try:
-            item.click(timeout=5000)
+            human_click(page, item, timeout=5000)
         except PWTimeout:
             break
         page.wait_for_timeout(rnd(1200, 2000))

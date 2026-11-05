@@ -59,6 +59,11 @@ bureau virtuel dedie.
 - Plafonds glissants cumules sur tous les passages : max_follows_per_hour, max_unfollows_per_hour ; plafonds du jour :
   max_unfollows_per_day ; max_following (plus d'abonnement au-dela, follow-back gardes compris). Les pauses sont
   calees sur 3600 / plafond (`human_pause`) ; `throttle()` attend ou arrete le passage.
+- Souris : tous les clics passent par `human_click` (molette jusqu'a l'element, trajectoire courbe `human_move`
+  vers un point au hasard du bouton, courte pause, appui puis relache espaces), le defilement des listes par
+  `scroll_dialog`. Ne pas revenir a `locator.click()` (curseur teleporte au centre, clic instantane) ; `_mouse_pos`
+  doit toujours suivre le curseur, sinon il saute au mouvement suivant. Repli sur le clic de Playwright ("Clic de
+  repli" dans log.txt) si l'element reste hors de vue ou est recouvert ; un element disparu leve PWTimeout.
 - Profil ouvert sans clic (deja plus suivi, introuvable, echec, page non chargee) ou source inaccessible :
   `profile_gap()`, pause de `profile_gap_seconds` (20 a 60 s) avant la page suivante, pour ne pas ouvrir plusieurs
   profils en quelques secondes.
