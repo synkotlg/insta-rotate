@@ -69,7 +69,9 @@ bureau virtuel dedie.
   plafonds horaires ne changent pas, seules certaines pauses sont plus courtes.
 - Souris : tous les clics passent par `human_click` (molette jusqu'a l'element, trajectoire courbe `human_move`
   vers un point au hasard du bouton, courte pause, appui puis relache espaces), le defilement des listes par
-  `scroll_dialog`. Ne pas revenir a `locator.click()` (curseur teleporte au centre, clic instantane) ; `_mouse_pos`
+  `scroll_dialog`, molette au-dessus de la partie qui defile (`JS_SCROLL_BOX`), jamais sur l'en-tete de la
+  fenetre ou reste le curseur apres le clic sur le compteur d'abonnes : la rien ne defile, la liste parait finie
+  (bug du 2026-11-06 : 14 lignes lues au lieu de 100). Ne pas revenir a `locator.click()` (curseur teleporte au centre, clic instantane) ; `_mouse_pos`
   doit toujours suivre le curseur, sinon il saute au mouvement suivant. Repli sur le clic de Playwright ("Clic de
   repli" dans log.txt) si l'element reste hors de vue ou est recouvert ; un element disparu leve PWTimeout.
 - Navigation : jamais d'adresse tapee pour un profil (`open_profile`) : ton profil par le lien de la barre de gauche,
@@ -121,7 +123,9 @@ bureau virtuel dedie.
   sans action (PC eteint) compte comme le repos minimum. Un jour actif PC eteint n'est pas rattrape.
 - Une seule source par passage, utilisee jusqu'au quota, en rotation dans l'ordre de seeds.txt (meta last_seed :
   le passage suivant part de la source d'apres). La source suivante n'est ouverte dans le meme passage que si
-  celle-ci est epuisee ou inaccessible, `seeds_per_run` sources au plus.
+  celle-ci est epuisee ou inaccessible, `seeds_per_run` sources au plus. Instagram ne montre qu'une vingtaine
+  d'abonnes d'un autre compte ("Et 3,2 M others" en fin de liste, constate le 2026-11-06) : une source donne
+  10 a 20 abonnements, "plus de compte a suivre : source suivante" est normal.
 - Reactions d'Instagram (`block_kind`) : "limit" -> pause block_cooldown_hours, quota_factor x 0,5 ; "warning" ->
   warning_cooldown_hours, quota_factor x 0,25 ; "attention" (verification d'identite, suspension, deconnexion, en
   cours de passage ou des l'ouverture) -> `register_attention` : meta needs_attention, arret total jusqu'a `login`,
@@ -151,7 +155,7 @@ bureau virtuel dedie.
 - Groupe temoin : `explore_share` (20 %) des nouveaux comptes ont `fixed_days = unfollow_days_max`. Ne pas le
   retirer : sans lui, une fois le delai raccourci, les follow-back tardifs ne sont plus observes.
 - L'ordre de la liste d'abonnes n'est pas fiable (pas chronologique) : elle est lue en entier, plafonnee a
-  `followback_scan_rows`. Le 2026-11-05 elle faisait 90 lignes (quelques defilements) : a revoir seulement si le
+  `followback_scan_rows`. Le 2026-11-06 elle faisait 100 lignes (environ 1 min) : a revoir seulement si le
   compte depasse quelques centaines d'abonnes.
 - Une erreur pendant cette lecture ou son ouverture (liste disparue, delai depasse) ne fait pas echouer le passage : capture
   `scan-error`, mesure du jour ignoree (relue au passage suivant), puis desabonnements et abonnements. Seul un

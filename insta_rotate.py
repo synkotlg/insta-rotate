@@ -1025,8 +1025,26 @@ def _inside(pos, box, margin=10):
             and box["x"] + margin < pos[0] < box["x"] + box["width"] - margin
             and box["y"] + margin < pos[1] < box["y"] + box["height"] - margin)
 
+# Zone de la liste qui defile dans une fenetre, en pixels de la fenetre : premier element defilable, dans
+# l'ordre du document (le conteneur passe avant ses lignes, l'en-tete ne defile pas). null si rien ne defile.
+# DOM generique, pas Instagram.
+JS_SCROLL_BOX = r"""dlg => {
+  for (const e of dlg.querySelectorAll('*')) {
+    if (e.scrollHeight <= e.clientHeight + 4) continue;
+    const o = getComputedStyle(e).overflowY;
+    if (o !== 'auto' && o !== 'scroll') continue;
+    const b = e.getBoundingClientRect();
+    const top = Math.max(0, b.top), bottom = Math.min(innerHeight, b.bottom);
+    if (bottom - top > 80 && b.width > 80) return {x: b.left, y: top, width: b.width, height: bottom - top};
+  }
+  return null;
+}"""
+
+
 def scroll_dialog(page, dlg):
-    box = dlg.bounding_box()
+    # la molette doit etre au-dessus de la liste elle-meme : sur l'en-tete de la fenetre (titre, champ de
+    # recherche, ou se trouve le curseur juste apres le clic sur le compteur d'abonnes), rien ne defile
+    box = dlg.evaluate(JS_SCROLL_BOX) or dlg.bounding_box()
     if box:
         pos = _mouse_pos.get(id(page))
         if not _inside(pos, box):
@@ -1059,7 +1077,8 @@ def scroll_dialog(page, dlg):
         split = random.uniform(0.3, 0.7)
         page.wait_for_timeout(pause * split)
         x, y = _mouse_pos.get(id(page), (box["x"] + box["width"] / 2, box["y"] + box["height"] / 2))
-        human_move(page, x + random.uniform(-25, 25), y + random.uniform(-20, 20))
+        human_move(page, min(max(x + random.uniform(-25, 25), box["x"] + 20), box["x"] + box["width"] - 20),
+                   min(max(y + random.uniform(-20, 20), box["y"] + 20), box["y"] + box["height"] - 20))
         page.wait_for_timeout(pause * (1 - split))
     else:
         page.wait_for_timeout(pause)

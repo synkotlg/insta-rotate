@@ -13,6 +13,8 @@ description: Diagnostiquer et corriger insta_rotate.py quand l'interface web d'I
    Desabonnements depuis ta liste de suivi(e)s : "pas desabonne depuis ta liste de suivi(e)s (failed)" ou "2 echecs
    depuis ta liste" -> FOLLOWING_COUNT_RE (compteur "N suivi(e)s"), NO_RESULT_RE, DIALOG_CLOSE_SEL (bouton Fermer).
    "(absent)" seul est normal (demande en attente, compte supprime). Fil d'actualite non ouvert -> HOME_NAV_SEL.
+   "Liste de tes abonnes : N lignes lues" bien plus bas que les jours precedents : la liste ne defile plus,
+   verifier que `JS_SCROLL_BOX` trouve encore la partie qui defile de la fenetre (curseur sur l'en-tete = rien ne bouge).
 2. Regarder les captures les plus recentes dans `data/debug/` (nom = date + etape).
 3. Relancer en visible pour observer : `.\.venv\Scripts\python.exe insta_rotate.py run --here --force`
    (baisser temporairement `follows_per_day` a 2 dans config.json pour un test court). Si une seule source echoue,
