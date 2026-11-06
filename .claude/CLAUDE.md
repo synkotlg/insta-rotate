@@ -10,6 +10,8 @@ bureau virtuel dedie.
 - Toutes les heures du script sont celles de Paris (cle `timezone`, "Europe/Paris"), pas celles du PC : `now()` /
   `today()` (plage horaire, jours, plafonds, horodatages de state.db sans fuseau attache), log.txt, captures,
   navigateur (`timezone_id`). Sous Windows, zoneinfo a besoin du paquet tzdata (requirements.txt).
+- Le PC lui-meme est regle sur l'heure de l'Inde (India Standard Time, constate le 2026-11-05) : le navigateur du bot
+  annonce Paris, mais tout autre navigateur de ce PC annonce l'Inde a Instagram. A regler dans Windows, pas ici.
 - setup.ps1 : `-Time` et 23:00 sont des heures de Paris. La tache garde un instant UTC, donc un changement de fuseau
   du PC ne la decale pas (pas besoin de relancer setup.ps1). Depart a `-Time` heure d'ete, fin a 23:00 heure
   d'hiver : en hiver le premier passage a lieu une heure plus tot, le script ignore ceux hors plage.
@@ -55,10 +57,16 @@ bureau virtuel dedie.
 
 ## Prudence (anti-limitation)
 - Montee en charge : `follow_budget()` = min(follows_per_day, ramp_start + ramp_step x jours d'abonnements precedents)
-  x quota_factor.
+  x quota_factor x volume du jour.
+- Volume du jour (`day_volume`) : tire une fois par jour dans `daily_volume` ([0,6 ; 1]), garde dans meta
+  day_volume:<date>, applique aux abonnements (`follow_budget`) et aux desabonnements autorises (`unfollow_room`) :
+  des jours plus calmes, jamais le meme maximum chaque jour. Ne fait que baisser les quotas.
 - Plafonds glissants cumules sur tous les passages : max_follows_per_hour, max_unfollows_per_hour ; plafonds du jour :
   max_unfollows_per_day ; max_following (plus d'abonnement au-dela, follow-back gardes compris). Les pauses sont
-  calees sur 3600 / plafond (`human_pause`) ; `throttle()` attend ou arrete le passage.
+  calees en moyenne sur 3600 / plafond (`human_pause`) ; `throttle()` attend ou arrete le passage.
+- Rafales (`human_pause`, demande explicite du 2026-11-06) : apres une pause normale, parfois 1 ou 2 actions
+  rapprochees (8 a 40 s), puis une pause plus longue qui rend le temps gagne (`_debt`) : le rythme moyen et les
+  plafonds horaires ne changent pas, seules certaines pauses sont plus courtes.
 - Souris : tous les clics passent par `human_click` (molette jusqu'a l'element, trajectoire courbe `human_move`
   vers un point au hasard du bouton, courte pause, appui puis relache espaces), le defilement des listes par
   `scroll_dialog`. Ne pas revenir a `locator.click()` (curseur teleporte au centre, clic instantane) ; `_mouse_pos`
@@ -70,6 +78,18 @@ bureau virtuel dedie.
   AZERTY ou lettre doublee) effacees au retour arriere, arret possible des que le compte apparait. Repli sur
   `page.goto` (log "profil non ouvert par la recherche") si le compte n'apparait pas (supprime, renomme) ou si
   l'interface a change. Seul l'accueil (`logged_in`) s'ouvre par son adresse.
+- Fenetres (listes d'abonnes, de suivi(e)s) : elles recouvrent toute la page, barre de gauche comprise, et Echap ne
+  les ferme pas. `close_dialogs` les ferme par leur bouton Fermer avant toute navigation (`open_profile`,
+  `browse_feed`) ; sans ca, la recherche suivante echoue et la page se recharge.
+- Desabonnements (`unfollow_pass`) : les abonnements directs (colonne `requested` = 0) depuis ta liste de suivi(e)s
+  (`unfollow_in_list` : pseudo tape dans le champ de la liste, Suivi(e), confirmation), les autres par leur profil
+  (`unfollow_one`) : demandes en attente (comptes prives, `requested` = 1, absentes de ta liste tant qu'elles ne
+  sont pas acceptees) et comptes suivis avant cette mesure (`requested` NULL). Les deux groupes dans un ordre tire
+  au hasard. Compte absent de la liste ou echec : passage par le profil ; apres 2 echecs de la liste dans un passage,
+  tout par le profil. `requested` est lu sur le bouton apres l'abonnement (`follow_kind`, "Demande" = demande).
+- Fil d'actualite (`browse_feed`) : 0, 1 ou 2 passages par passage (15 / 60 / 25 %), souvent au debut, de
+  `browse_seconds` (40 a 150 s) : molette et temps de lecture, aucun clic (ni like, ni story). Compte dans le temps
+  de passage.
 - Pauses jamais figees : `capped_wait` et les attentes de `throttle` passent par `idle` (petits gestes au hasard,
   curseur ou molette, sans clic, avec des absences). `rnd(lo, hi)` : jamais moins que lo, mediane au milieu, une
   fois sur dix plus long (jusqu'a lo + 3 x (hi - lo)) ; pause longue au hasard (1 sur `long_pause_every` en
@@ -78,11 +98,19 @@ bureau virtuel dedie.
   (25 %) passes sans abonnement. Desabonnements (`due`) : les plus anciens, dans un ordre melange (jamais
   alphabetique), ceux en echec en dernier.
 - Ordre du passage tire au hasard (`task_order`) : lecture de tes abonnes toujours avant les desabonnements ; parfois
-  2 a 5 abonnements avant (au debut ou apres la lecture), le reste apres. Si ces premiers abonnements butent sur le
-  plafond horaire, les desabonnements continuent quand meme (plus d'abonnement dans ce passage).
+  2 a 5 abonnements avant (au debut ou apres la lecture), le reste apres ; passages sur le fil inseres au hasard
+  (jamais deux de suite). Si ces premiers abonnements butent sur le plafond horaire, les desabonnements continuent
+  quand meme (plus d'abonnement dans ce passage).
 - Navigateur (`launch`) : sans `--enable-automation` (navigator.webdriver = true, bandeau) ni `--disable-extensions`,
-  avec `--disable-blink-features=AutomationControlled`. Ne pas les remettre. Fenetre de la taille de l'ecran (zone de
+  avec `--disable-blink-features=AutomationControlled`. Ne pas les remettre. Pas d'option `locale` de Playwright
+  (elle reduisait navigator.languages et Accept-Language a une seule langue) : `--lang` pour l'interface, les
+  langues annoncees sont celles du profil (fr-FR, fr, en-US, en). Fenetre de la taille de l'ecran (zone de
   travail), en haut a gauche ; jamais laissee a -32000 (position lisible depuis la page).
+- Depart decale : un passage planifie (sans `--here` ni `--force`) qui a du travail attend `start_delay_minutes`
+  (0 a 20 min) avant d'ouvrir le navigateur, pour ne pas commencer a la meme minute chaque heure.
+- Restent visibles cote technique, sans correction propre : la connexion de pilotage de Playwright (detectable par
+  des techniques avancees) et les scripts evalues dans la page elle-meme. Seul un Playwright modifie par des tiers
+  les retirerait : pas fait.
 - Profil ouvert sans clic (deja plus suivi, introuvable, echec, page non chargee) ou source inaccessible :
   `profile_gap()`, pause de `profile_gap_seconds` (20 a 60 s) avant la page suivante, pour ne pas ouvrir plusieurs
   profils en quelques secondes.
@@ -123,7 +151,8 @@ bureau virtuel dedie.
 - Groupe temoin : `explore_share` (20 %) des nouveaux comptes ont `fixed_days = unfollow_days_max`. Ne pas le
   retirer : sans lui, une fois le delai raccourci, les follow-back tardifs ne sont plus observes.
 - L'ordre de la liste d'abonnes n'est pas fiable (pas chronologique) : elle est lue en entier, plafonnee a
-  `followback_scan_rows`.
+  `followback_scan_rows`. Le 2026-11-05 elle faisait 90 lignes (quelques defilements) : a revoir seulement si le
+  compte depasse quelques centaines d'abonnes.
 - Une erreur pendant cette lecture ou son ouverture (liste disparue, delai depasse) ne fait pas echouer le passage : capture
   `scan-error`, mesure du jour ignoree (relue au passage suivant), puis desabonnements et abonnements. Seul un
   navigateur ferme arrete le passage.

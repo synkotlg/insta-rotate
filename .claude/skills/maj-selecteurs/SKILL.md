@@ -10,6 +10,9 @@ description: Diagnostiquer et corriger insta_rotate.py quand l'interface web d'I
    verification de connexion, ou ouverture d'un profil par la recherche ("profil non ouvert par la recherche" pour
    presque chaque compte, y compris ceux qui existent : selecteurs SEARCH_* ou PROFILE_LINK_SEL). Beaucoup de
    "Clic de repli" : un element recouvert par un autre (comme le champ de recherche, recouvert par son bouton).
+   Desabonnements depuis ta liste de suivi(e)s : "pas desabonne depuis ta liste de suivi(e)s (failed)" ou "2 echecs
+   depuis ta liste" -> FOLLOWING_COUNT_RE (compteur "N suivi(e)s"), NO_RESULT_RE, DIALOG_CLOSE_SEL (bouton Fermer).
+   "(absent)" seul est normal (demande en attente, compte supprime). Fil d'actualite non ouvert -> HOME_NAV_SEL.
 2. Regarder les captures les plus recentes dans `data/debug/` (nom = date + etape).
 3. Relancer en visible pour observer : `.\.venv\Scripts\python.exe insta_rotate.py run --here --force`
    (baisser temporairement `follows_per_day` a 2 dans config.json pour un test court). Si une seule source echoue,
