@@ -141,6 +141,10 @@ DEFAULTS = {
     "max_follows_per_hour": 20,
     "max_unfollows_per_hour": 25,
     "max_unfollows_per_day": 100,
+    # plafonds sur 24 h glissantes, reduits par quota_factor : les limitations du 12/11 et du 24/11 sont tombees a
+    # 61-62 abonnements en 24 h (passage le soir puis le lendemain matin), aucune en dessous de 55
+    "max_follows_per_24h": 40,
+    "max_actions_per_24h": 70,
     "max_following": 1000,
     "max_wait_minutes": 75,
     "pause_jitter": [0.6, 1.5],
@@ -540,17 +544,46 @@ def day_volume(st, cfg):
     return float(value)
 
 
+def quota_factor(st):
+    """Coefficient des quotas : 1 sans reaction d'Instagram, reduit apres un blocage (register_block)."""
+    return float(st.get_meta("quota_factor") or 1.0)
+
+
 def follow_budget(st, cfg):
     """Abonnements autorises aujourd'hui : montee en charge progressive, reduite apres un blocage, et volume
     du jour."""
     ramp = cfg["ramp_start"] + cfg["ramp_step"] * st.active_follow_days()
-    factor = float(st.get_meta("quota_factor") or 1.0)
-    return max(0, int(min(cfg["follows_per_day"], ramp) * factor * day_volume(st, cfg)))
+    return max(0, int(min(cfg["follows_per_day"], ramp) * quota_factor(st) * day_volume(st, cfg)))
 
 
 def unfollow_room(st, cfg):
-    """Desabonnements encore autorises aujourd'hui : max_unfollows_per_day x volume du jour."""
-    return max(0, int(cfg["max_unfollows_per_day"] * day_volume(st, cfg)) - st.unfollowed_today())
+    """Desabonnements encore autorises aujourd'hui : max_unfollows_per_day x volume du jour x coefficient."""
+    return max(0, int(cfg["max_unfollows_per_day"] * day_volume(st, cfg) * quota_factor(st)) - st.unfollowed_today())
+
+
+def room_24h(st, cfg):
+    """(abonnements, actions) encore possibles sur 24 h glissantes : max_follows_per_24h et max_actions_per_24h
+    x coefficient. Les quotas par jour civil laissaient passer deux passages complets en moins de 16 h (le soir,
+    puis le lendemain matin) : c'est la que sont tombees les deux limitations de novembre."""
+    since = now() - timedelta(hours=24)
+    follows = len(st.actions_since("follow", since))
+    actions = follows + len(st.actions_since("unfollow", since))
+    factor = quota_factor(st)
+    return (max(0, int(cfg["max_follows_per_24h"] * factor) - follows),
+            max(0, int(cfg["max_actions_per_24h"] * factor) - actions))
+
+
+def hourly_cap(cfg, kind):
+    """Plafond horaire effectif : max_<kind>s_per_hour x coefficient du passage (cfg['_pace'] = quota_factor). Il
+    fixe aussi la duree moyenne des pauses (human_pause) : apres une reaction d'Instagram le rythme ralentit
+    vraiment. Avant, seul le quota du jour baissait, jamais atteint : meme nombre d'actions qu'un jour normal."""
+    return max(1, round(cfg[f"max_{kind}s_per_hour"] * cfg.get("_pace", 1.0)))
+
+
+def day_minutes(st, cfg):
+    """Temps de passage maximal aujourd'hui : daily_minutes x volume du jour (0 = illimite). C'est le temps qui
+    borne le volume du jour, pas les quotas : sans ce facteur, chaque jour comptait environ 48 actions."""
+    return cfg["daily_minutes"] * day_volume(st, cfg) if cfg["daily_minutes"] else 0
 
 
 def register_block(st, cfg, kind):
@@ -595,12 +628,20 @@ def minutes_left(st, cfg):
     if not cfg["daily_minutes"]:
         return None
     used = float(st.get_meta(f"run_seconds:{today().isoformat()}") or 0)
-    return max(0.0, cfg["daily_minutes"] - used / 60)
+    return max(0.0, day_minutes(st, cfg) - used / 60)
 
 
-def add_run_time(st, started):
+def add_run_time(st, cfg):
+    """Ajoute au temps de passage du jour le temps ecoule depuis le dernier releve (cfg['_mark']). Appele avant
+    chaque action (throttle) et en fin de passage : un passage coupe net (PC eteint, comme le 23/11 au matin)
+    garde le temps deja passe, au lieu de laisser un second passage complet le meme jour."""
+    mark = cfg.get("_mark")
+    if not mark:
+        return
+    moment = now()
     key = f"run_seconds:{today().isoformat()}"
-    st.set_meta(key, str(float(st.get_meta(key) or 0) + (now() - started).total_seconds()))
+    st.set_meta(key, str(float(st.get_meta(key) or 0) + (moment - mark).total_seconds()))
+    cfg["_mark"] = moment
 
 
 def keep_awake(on):
@@ -617,9 +658,10 @@ def keep_awake(on):
 
 
 def throttle(page, st, cfg, kind):
-    """Respecte le plafond horaire (cumule sur tous les passages), la plage horaire et le temps de
-    passage du jour. Retourne False s'il faut s'arreter pour aujourd'hui."""
-    limit = cfg[f"max_{kind}s_per_hour"]
+    """Respecte les plafonds sur 24 h glissantes et le plafond horaire (cumules sur tous les passages), la plage
+    horaire et le temps de passage du jour. Retourne False s'il faut s'arreter (plus de `kind` dans ce passage)."""
+    add_run_time(st, cfg)
+    limit = hourly_cap(cfg, kind)
     deadline = cfg.get("_deadline")
     while True:
         moment = now()
@@ -627,7 +669,15 @@ def throttle(page, st, cfg, kind):
             log.info("Hors de la plage horaire %dh-%dh : arret, reprise au prochain passage", *cfg["active_hours"])
             return False
         if deadline and moment >= deadline:
-            log.info("Temps de passage du jour ecoule (%d min) : arret, reprise au prochain passage", cfg["daily_minutes"])
+            log.info("Temps de passage du jour ecoule (%d min) : arret, reprise au prochain passage",
+                     day_minutes(st, cfg))
+            return False
+        follows_left, actions_left = room_24h(st, cfg)
+        if not actions_left or (kind == "follow" and not follows_left):
+            factor = quota_factor(st)
+            log.info("Plafond sur 24 h glissantes atteint (%d abonnements, %d actions au plus) : plus %s dans ce "
+                     "passage", int(cfg["max_follows_per_24h"] * factor), int(cfg["max_actions_per_24h"] * factor),
+                     "d'action" if not actions_left else "d'abonnement")
             return False
         recent = st.actions_since(kind, moment - timedelta(hours=1))
         if len(recent) < limit:
@@ -901,7 +951,7 @@ def human_pause(page, cfg, kind):
     deux actions rapprochees (8 a 40 s), puis une pause plus longue qui rend le temps gagne. Le rythme moyen
     reste 3600 s / plafond horaire (avec variation), et throttle() garde le plafond horaire. Pause longue au
     hasard (une fois sur long_pause_every en moyenne)."""
-    base = 3600 / cfg[f"max_{kind}s_per_hour"] * rnd(*cfg["pause_jitter"])
+    base = 3600 / hourly_cap(cfg, kind) * rnd(*cfg["pause_jitter"])
     if random.random() < 1 / cfg["long_pause_every"]:
         base += rnd(*cfg["long_pause_seconds"])
     burst = cfg.setdefault("_burst", {})
@@ -1437,8 +1487,11 @@ def follow_from_seed(page, seed, quota, st, cfg, fixed_days=lambda: None):
                 skip.add(user)
                 log.info("[%s] abonnement a @%s non pris en compte (%d de suite)", seed, user, fails)
                 shot(page, cfg, f"follow-{user}")
-                if fails >= 3:
+                if fails >= 2:
                     return done, "blocked"
+                # pas de nouvel essai aussitot : le 12/11 et le 24/11, trois clics refuses en 30 s juste avant la
+                # limitation. Pause normale (sans rafale), puis un seul autre essai.
+                capped_wait(page, cfg, 3600 / hourly_cap(cfg, "follow") * rnd(*cfg["pause_jitter"]))
                 continue
             fails = 0
             st.add_follow(user, fixed_days(), follow_kind(dlg, user))
@@ -1804,7 +1857,8 @@ def run_outcome(status, kind, pause, error):
         hours, factor = pause
         return f"réaction d'Instagram ({kind}), pause de {hours} h, quotas ramenés à {factor * 100:.0f} %", None
     if status == "stop":
-        return "arrêté avant la fin (plafond horaire, plage horaire ou temps du jour), reprise au prochain passage", None
+        return ("arrêté avant la fin (plafond horaire ou sur 24 h, plage horaire ou temps du jour), reprise au "
+                "prochain passage"), None
     if status == "slow":
         return "pages Instagram qui ne chargent pas (connexion ou Instagram lent), reprise au prochain passage", None
     return "OK", None
@@ -1819,7 +1873,7 @@ def format_summary(st, cfg, started, outcome, days, budget):
         f"Fin du passage en {format_duration((now() - started).total_seconds())} : {outcome}",
         f"Ce passage : {len(followed)} abonnements, {len(unfollowed)} désabonnements",
         f"Aujourd'hui : {st.followed_today()}/{budget} abonnements, {st.unfollowed_today()} désabonnements, "
-        f"{used:.0f} min de passage" + (f" sur {cfg['daily_minutes']}" if cfg["daily_minutes"] else ""),
+        f"{used:.0f} min de passage" + (f" sur {day_minutes(st, cfg):.0f}" if cfg["daily_minutes"] else ""),
         f"Comptes suivis par le script : {st.count('unfollowed_on IS NULL')} dont {st.kept()} follow-back gardés, "
         f"désabonnement des autres après {days} j",
     ]
@@ -1902,8 +1956,9 @@ def cmd_status(cfg):
     base = cfg["unfollow_after_days"]
     days = int(st.get_meta("current_days") or base) if cfg["adaptive_delay"] else base
     stats = followback_stats(st.samples(cfg["adapt_window_days"]), cfg, base)
-    factor = float(st.get_meta("quota_factor") or 1.0)
-    print(f"Heure du script                            : {now():%Y-%m-%d %H:%M} ({cfg['timezone']}, "
+    factor = quota_factor(st)
+    cfg["_pace"] = factor
+    print(f"Heure du script                           : {now():%Y-%m-%d %H:%M} ({cfg['timezone']}, "
           f"plage {cfg['active_hours'][0]}h-{cfg['active_hours'][1]}h)")
     print(f"Abonnements en cours (faits par le script) : {st.count('unfollowed_on IS NULL')}")
     print(f"Dont follow-back gardes                    : {st.kept()}")
@@ -1916,8 +1971,12 @@ def cmd_status(cfg):
           f"{day_volume(st, cfg) * 100:.0f} %)")
     print(f"Total historique                           : {st.count()}")
     used = float(st.get_meta(f"run_seconds:{today().isoformat()}") or 0) / 60
-    print(f"Temps de passage aujourd'hui               : {used:.0f} / {cfg['daily_minutes'] or 'illimite'} min"
-          f" (rythme : {cfg['max_follows_per_hour']} abonnements ou {cfg['max_unfollows_per_hour']} desabonnements par heure)")
+    limit = f"{day_minutes(st, cfg):.0f}" if cfg["daily_minutes"] else "illimite"
+    print(f"Temps de passage aujourd'hui               : {used:.0f} / {limit} min"
+          f" (rythme : {hourly_cap(cfg, 'follow')} abonnements ou {hourly_cap(cfg, 'unfollow')} desabonnements par heure)")
+    follows_left, actions_left = room_24h(st, cfg)
+    print(f"Encore possibles sur 24 h glissantes       : {follows_left} abonnements, {actions_left} actions (plafonds "
+          f"{int(cfg['max_follows_per_24h'] * factor)} / {int(cfg['max_actions_per_24h'] * factor)})")
     print(f"Delai de desabonnement actuel              : {days} jours (base {base})")
     print(f"Follow-back                                : {describe(stats)}")
     print(f"Sources                                    : {len(cfg['seeds'])} comptes ({cfg['seeds_source']})")
@@ -2013,8 +2072,16 @@ def cmd_run(cfg, here, force=False):
                     "pas de nouvel abonnement", following, st.kept())
         quota = 0
     room = unfollow_room(st, cfg)
-    if not quota and not (room and st.due(days, 1)):
-        log.info("Rien a faire aujourd'hui (abonnements autorises : %d)", budget)
+    follows_left, actions_left = room_24h(st, cfg)
+    capped = quota > min(follows_left, actions_left) or room > actions_left
+    quota, room = min(quota, follows_left, actions_left), min(room, actions_left)
+    # au moins 3 actions possibles : pas de navigateur ouvert pour un seul abonnement libere par la fenetre de 24 h
+    if quota + len(st.due(days, room)) < 3:
+        if capped:
+            log.info("Plafond sur 24 h glissantes atteint (encore %d abonnement(s), %d action(s) possibles) : "
+                     "reprise quand les actions de la veille sortent de la fenetre", follows_left, actions_left)
+        else:
+            log.info("Rien a faire aujourd'hui (abonnements autorises : %d)", budget)
         return 0
     alive = [seed for seed in cfg["seeds"] if int(st.get_meta(f"seed_fail:{seed}") or 0) < 3]
     if quota and not alive:
@@ -2024,8 +2091,9 @@ def cmd_run(cfg, here, force=False):
         return 1
     left = minutes_left(st, cfg)
     if left is not None and left < 5:
-        log.info("Temps de passage du jour deja utilise (%d min) : aucune action avant demain", cfg["daily_minutes"])
+        log.info("Temps de passage du jour deja utilise (%d min) : aucune action avant demain", day_minutes(st, cfg))
         return 0
+    cfg["_pace"] = quota_factor(st)  # rythme ralenti apres une reaction d'Instagram (hourly_cap, human_pause)
     if not here and not force:  # passage planifie : depart decale, pas a la meme minute chaque heure
         delay = random.uniform(*cfg["start_delay_minutes"])
         if delay >= 0.5:
@@ -2074,7 +2142,7 @@ def cmd_run(cfg, here, force=False):
                     status, error = "session", None
                     return 3
                 watchdog.cancel()
-                ready = now()
+                ready = cfg["_mark"] = now()
                 left = minutes_left(st, cfg)
                 cfg["_deadline"] = ready + timedelta(minutes=left) if left is not None else None
                 # une seule source par passage, utilisee jusqu'au quota ; la suivante n'est ouverte que si
@@ -2145,7 +2213,7 @@ def cmd_run(cfg, here, force=False):
     finally:
         watchdog.cancel()
         if ready:
-            add_run_time(st, ready)
+            add_run_time(st, cfg)
         keep_awake(False)
         try:  # fin du passage annoncee dans tous les cas, sans jamais faire echouer le passage
             outcome, code = run_outcome(status, kind, pause, error)

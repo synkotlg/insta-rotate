@@ -59,11 +59,21 @@ bureau virtuel dedie.
 - Montee en charge : `follow_budget()` = min(follows_per_day, ramp_start + ramp_step x jours d'abonnements precedents)
   x quota_factor x volume du jour.
 - Volume du jour (`day_volume`) : tire une fois par jour dans `daily_volume` ([0,6 ; 1]), garde dans meta
-  day_volume:<date>, applique aux abonnements (`follow_budget`) et aux desabonnements autorises (`unfollow_room`) :
-  des jours plus calmes, jamais le meme maximum chaque jour. Ne fait que baisser les quotas.
-- Plafonds glissants cumules sur tous les passages : max_follows_per_hour, max_unfollows_per_hour ; plafonds du jour :
-  max_unfollows_per_day ; max_following (plus d'abonnement au-dela, follow-back gardes compris). Les pauses sont
-  calees en moyenne sur 3600 / plafond (`human_pause`) ; `throttle()` attend ou arrete le passage.
+  day_volume:<date>, applique aux abonnements (`follow_budget`), aux desabonnements autorises (`unfollow_room`) et
+  au temps de passage du jour (`day_minutes`) : des jours plus calmes, jamais le meme maximum chaque jour. Ne fait
+  que baisser les quotas. Avant le 2026-11-26 il ne touchait pas au temps, qui bornait seul le volume : environ 48
+  actions tous les jours, quel que soit le tirage.
+- Plafonds sur 24 h glissantes (`room_24h`, `throttle`) : max_follows_per_24h (40) et max_actions_per_24h (70,
+  abonnements + desabonnements), x quota_factor. Les deux limitations de novembre (12/11, 24/11) sont tombees a 61-62
+  abonnements en 24 h : un passage le soir (PC allume tard) puis un autre le lendemain matin, que les quotas par jour
+  civil laissaient passer ; aucune limitation en dessous de 55. Plafond atteint : plus d'abonnement (ou plus
+  d'action) dans ce passage, reprise quand les actions de la veille sortent de la fenetre ; pas de navigateur ouvert
+  pour moins de 3 actions possibles.
+- Plafonds glissants cumules sur tous les passages : max_follows_per_hour, max_unfollows_per_hour, x quota_factor
+  (`hourly_cap`, cfg["_pace"]) ; plafonds du jour : max_unfollows_per_day ; max_following (plus d'abonnement
+  au-dela, follow-back gardes compris). Les pauses sont calees en moyenne sur 3600 / plafond effectif
+  (`human_pause`) : apres une reaction d'Instagram le rythme ralentit vraiment ; `throttle()` attend ou arrete le
+  passage.
 - Rafales (`human_pause`, demande explicite du 2026-11-06) : apres une pause normale, parfois 1 ou 2 actions
   rapprochees (8 a 40 s), puis une pause plus longue qui rend le temps gagne (`_debt`) : le rythme moyen et les
   plafonds horaires ne changent pas, seules certaines pauses sont plus courtes.
@@ -131,16 +141,22 @@ bureau virtuel dedie.
   cours de passage ou des l'ouverture) -> `register_attention` : meta needs_attention, arret total jusqu'a `login`,
   plus la pause et les quotas de "warning", comptes des la detection (le `login` ne les leve pas). La pause double
   a chaque blocage rapproche (14 jours max) ;
-  quota_factor remonte de 0,1 par jour sans reaction. Trois clics ignores de suite = limitation silencieuse ("limit").
+  quota_factor remonte de 0,1 par jour sans reaction. quota_factor reduit le quota du jour, les desabonnements
+  autorises, les plafonds sur 24 h et les plafonds horaires (donc les pauses). Deux clics ignores de suite =
+  limitation silencieuse ("limit") ; apres le premier, pause normale (sans rafale) avant l'essai suivant (avant :
+  trois clics refuses en 30 s, juste avant chaque limitation).
 
 ## Temps de passage (PC non allume toute la journee)
-- `daily_minutes` (180 par defaut, 0 = illimite) : temps de passage maximal par jour, cumule sur tous les passages
-  (meta run_seconds:<date>), compte a partir de la connexion a Instagram (le demarrage n'est pas decompte). Le
+- `daily_minutes` (180 par defaut, 0 = illimite) x volume du jour (`day_minutes`) : temps de passage maximal par
+  jour, cumule sur tous les passages (meta run_seconds:<date>), compte a partir de la connexion a Instagram (le
+  demarrage n'est pas decompte), enregistre avant chaque action (`add_run_time` depuis `throttle`, cfg["_mark"]) : un
+  passage coupe net (PC eteint, le 2026-11-23) garde son temps, au lieu d'en laisser un second complet. Le
   passage s'arrete proprement a l'echeance (`cfg["_deadline"]`, lue par `throttle` et
   `human_pause`) ; les desabonnements passent avant les abonnements (sauf 2 a 5 abonnements dans certains passages,
   voir `task_order`). Le travail non fait n'est pas rattrape (pas de rafale).
 - A rythme prudent : environ max_follows_per_hour abonnements ou max_unfollows_per_hour desabonnements par heure de PC
-  allume. Le volume du jour est donc fixe par le temps disponible, pas par follows_per_day.
+  allume (x quota_factor). Le volume du jour est donc fixe par le temps disponible et les plafonds sur 24 h, pas par
+  follows_per_day.
 - `keep_awake` : empeche la mise en veille Windows pendant le passage (SetThreadExecutionState).
 
 ## Delai de desabonnement adaptatif
