@@ -134,7 +134,7 @@ DEFAULTS = {
     # seeds_per_run si la source du passage est epuisee ou inaccessible
     "seeds_per_run": 6,
     "follows_per_day": 100,
-    "unfollow_after_days": 5,
+    "unfollow_after_days": 7,
     # prudence : montee en charge, plafonds, plage horaire, repos, reaction aux blocages
     "ramp_start": 20,
     "ramp_step": 10,
@@ -148,11 +148,18 @@ DEFAULTS = {
     "max_following": 1000,
     "max_wait_minutes": 75,
     "pause_jitter": [0.6, 1.5],
+    # abonnements par rafales, puis une longue pause qui rend le temps gagne (rythme moyen inchange) ; taille bornee
+    # a la moitie du plafond horaire effectif
+    "follow_burst": [3, 8],
+    "burst_gap_seconds": [4, 15],
     "long_pause_every": 10,
     "long_pause_seconds": [120, 300],
     # apres un profil ouvert sans clic (deja plus suivi, introuvable, echec) : pas de rafale de pages
     "profile_gap_seconds": [20, 60],
     "active_hours": [8, 23],
+    # heure de depart du jour, tiree chaque jour au hasard dans cette plage : les passages planifies n'agissent pas
+    # avant (plus de bloc de 3 h qui commence a 9h tous les matins)
+    "day_start_hours": [9, 18],
     "daily_minutes": 180,
     "keep_awake": True,
     # demarrage (navigateur, bureau virtuel, connexion) plus long : alerte et arret du passage
@@ -163,7 +170,9 @@ DEFAULTS = {
     "warning_cooldown_hours": 168,
     # delai adaptatif : mesure du temps de follow-back, puis ajustement du desabonnement
     "adaptive_delay": True,
-    "unfollow_days_min": 2,
+    # jamais de desabonnement avant 7 jours : un abonnement de quelques jours est la signature du suivre/desabonner
+    # (les follow-back arrivent en 1 jour en mediane, ce minimum n'en perd presque aucun)
+    "unfollow_days_min": 7,
     "unfollow_days_max": 7,
     "adapt_target_share": 0.9,
     "adapt_min_events": 25,
@@ -430,7 +439,7 @@ def followback_stats(samples, cfg, base):
     Tant que cette fenetre longue n'est pas observee sur assez de comptes, delay reste `base`."""
     lo = cfg["unfollow_days_min"]
     hi = max(cfg["unfollow_days_max"], base)
-    out = {"delay": base, "events": sum(1 for _, ev in samples if ev), "rate": None,
+    out = {"delay": max(lo, base), "events":sum(1 for _, ev in samples if ev), "rate": None,
            "mean": None, "median": None, "horizon": None, "adapted": False}
     curve = km_cdf(samples, hi)
     usable = [t for t, (_, n) in curve.items() if n >= cfg["adapt_min_at_risk"]]
@@ -451,6 +460,15 @@ def followback_stats(samples, cfg, base):
         out["delay"] = max(lo, min(hi, d))
         out["adapted"] = True
     return out
+
+
+def current_delay(st, cfg):
+    """Delai de desabonnement courant : meta current_days (delai adaptatif), jamais sous unfollow_days_min (une
+    valeur gardee avant un relevement du minimum ne s'applique plus) ; unfollow_after_days sans mesure."""
+    base = cfg["unfollow_after_days"]
+    if not (cfg["adaptive_delay"] and cfg["username"]):
+        return base
+    return max(cfg["unfollow_days_min"], int(st.get_meta("current_days") or base))
 
 
 def describe(stats):
@@ -530,6 +548,22 @@ def announce_week(cfg, st, notify):
 def in_active_hours(cfg, moment):
     lo, hi = cfg["active_hours"]
     return lo <= moment.hour < hi
+
+
+def day_start(st, cfg):
+    """Heure de depart du jour, tiree une fois par jour au hasard dans day_start_hours (9h-18h) et gardee dans
+    meta day_start:<date> (HH:MM). Les passages planifies n'agissent pas avant : plus de passage qui commence a
+    9h tous les matins."""
+    key = f"day_start:{today().isoformat()}"
+    value = st.get_meta(key)
+    if value is None:
+        lo, hi = cfg["day_start_hours"]
+        minutes = random.randint(int(lo * 60), int(hi * 60))
+        value = f"{minutes // 60:02d}:{minutes % 60:02d}"
+        st.set_meta(key, value)
+    hour, minute = map(int, value.split(":"))
+    d = today()
+    return datetime(d.year, d.month, d.day, hour, minute)
 
 
 def day_volume(st, cfg):
@@ -946,11 +980,22 @@ def logged_in(page):
     return page.locator(LOGGED_IN_SEL).count() > 0
 
 
+def next_burst(cfg, kind):
+    """Actions rapprochees qui suivront la prochaine action (taille de la rafale moins un). Abonnements : rafale
+    de follow_burst (3 a 8), au plus la moitie du plafond horaire effectif (plus petites apres un blocage).
+    Desabonnements : le plus souvent aucune, parfois une ou deux."""
+    if kind == "follow":
+        lo, hi = cfg["follow_burst"]
+        return random.randint(lo, max(lo, min(hi, hourly_cap(cfg, kind) // 2))) - 1
+    return random.choices((0, 1, 2), weights=(50, 35, 15))[0]
+
+
 def human_pause(page, cfg, kind):
-    """Pause entre deux actions, en petites rafales comme a la main : apres une pause normale, parfois une ou
-    deux actions rapprochees (8 a 40 s), puis une pause plus longue qui rend le temps gagne. Le rythme moyen
-    reste 3600 s / plafond horaire (avec variation), et throttle() garde le plafond horaire. Pause longue au
-    hasard (une fois sur long_pause_every en moyenne)."""
+    """Pause entre deux actions, par rafales comme a la main. Abonnements (demande du 2026-11-26) : rafales de
+    3 a 8 abonnements a burst_gap_seconds d'intervalle, puis une longue pause qui rend le temps gagne.
+    Desabonnements : parfois une ou deux actions rapprochees (8 a 40 s). Le rythme moyen reste 3600 s / plafond
+    horaire effectif (avec variation), et throttle() garde les plafonds horaires et sur 24 h. Pause longue en plus
+    au hasard (une fois sur long_pause_every en moyenne)."""
     base = 3600 / hourly_cap(cfg, kind) * rnd(*cfg["pause_jitter"])
     if random.random() < 1 / cfg["long_pause_every"]:
         base += rnd(*cfg["long_pause_seconds"])
@@ -958,10 +1003,10 @@ def human_pause(page, cfg, kind):
     debt = cfg.setdefault("_debt", {})
     if burst.get(kind, 0) > 0:  # dans une rafale : action suivante rapprochee, le temps gagne est rendu ensuite
         burst[kind] -= 1
-        secs = rnd(8, 40)
+        secs = rnd(*cfg["burst_gap_seconds"]) if kind == "follow" else rnd(8, 40)
         debt[kind] = debt.get(kind, 0.0) + max(0.0, base - secs)
-    else:
-        burst[kind] = random.choices((0, 1, 2), weights=(50, 35, 15))[0]
+    else:  # fin de rafale : pause normale plus le temps gagne pendant la rafale
+        burst[kind] = next_burst(cfg, kind)
         secs = base + debt.pop(kind, 0.0)
     capped_wait(page, cfg, secs)
 
@@ -976,7 +1021,7 @@ def capped_wait(page, cfg, secs):
     deadline = cfg.get("_deadline")
     if deadline:  # inutile de dormir au-dela du temps de passage
         secs = min(secs, max(0.0, (deadline - now()).total_seconds()))
-    idle(page, secs)
+    idle(page, secs, busy=secs < 300)  # longue pause (apres une rafale) : gestes rares, absences plus longues
 
 
 # ---------------------------------------------------------------------------
@@ -1954,7 +1999,7 @@ def cmd_login(cfg):
 def cmd_status(cfg):
     st = State(DB_PATH)
     base = cfg["unfollow_after_days"]
-    days = int(st.get_meta("current_days") or base) if cfg["adaptive_delay"] else base
+    days = current_delay(st, cfg)
     stats = followback_stats(st.samples(cfg["adapt_window_days"]), cfg, base)
     factor = quota_factor(st)
     cfg["_pace"] = factor
@@ -1971,6 +2016,8 @@ def cmd_status(cfg):
           f"{day_volume(st, cfg) * 100:.0f} %)")
     print(f"Total historique                           : {st.count()}")
     used = float(st.get_meta(f"run_seconds:{today().isoformat()}") or 0) / 60
+    print(f"Depart du jour (passages planifies)        : {day_start(st, cfg):%H:%M} (tire entre "
+          f"{cfg['day_start_hours'][0]}h et {cfg['day_start_hours'][1]}h)")
     limit = f"{day_minutes(st, cfg):.0f}" if cfg["daily_minutes"] else "illimite"
     print(f"Temps de passage aujourd'hui               : {used:.0f} / {limit} min"
           f" (rythme : {hourly_cap(cfg, 'follow')} abonnements ou {hourly_cap(cfg, 'unfollow')} desabonnements par heure)")
@@ -2055,13 +2102,21 @@ def cmd_run(cfg, here, force=False):
         return 0
     base = cfg["unfollow_after_days"]
     analysis = bool(cfg["adaptive_delay"] and cfg["username"])
-    days = int(st.get_meta("current_days") or base) if analysis else base
+    days = current_delay(st, cfg)
     announce_week(cfg, st, notify)  # avant le repos : un lundi de repos est annonce lui aussi
     if not force and is_rest_day(cfg, st, today()):
         log.info("Jour de repos (planning de la semaine) : aucune action aujourd'hui, "
                  "%d desabonnement(s) en attente, reprise demain (--force pour passer outre)",
                  len(st.due(days, 10**6)))
         return 0
+    start_wait = 0.0
+    if not here and not force:  # passage planifie : rien avant l'heure de depart du jour
+        start = day_start(st, cfg)
+        start_wait = (start - now()).total_seconds()
+        # la tache relance toutes les heures : le passage qui tombe dans l'heure d'avant attend l'heure tiree
+        if start_wait > 65 * 60:
+            log.info("Depart du jour tire a %s : aucune action avant (--force pour passer outre)", f"{start:%H:%M}")
+            return 0
     if cfg["adaptive_delay"] and not cfg["username"]:
         log.warning("Cle 'username' absente de config.json : pas de mesure des follow-back, delai fixe de %d jours", base)
     budget = follow_budget(st, cfg)
@@ -2095,9 +2150,16 @@ def cmd_run(cfg, here, force=False):
         return 0
     cfg["_pace"] = quota_factor(st)  # rythme ralenti apres une reaction d'Instagram (hourly_cap, human_pause)
     if not here and not force:  # passage planifie : depart decale, pas a la meme minute chaque heure
-        delay = random.uniform(*cfg["start_delay_minutes"])
+        if start_wait > 0:  # heure de depart du jour dans l'heure : attente jusqu'a elle
+            delay = start_wait / 60
+            log.info("Depart du jour a %s : attente de %d min", f"{day_start(st, cfg):%H:%M}", delay)
+        else:
+            delay = random.uniform(*cfg["start_delay_minutes"])
+            if delay >= 0.5:
+                log.info("Depart decale de %d min", delay)
         if delay >= 0.5:
-            log.info("Depart decale de %d min", delay)
+            if cfg["keep_awake"]:
+                keep_awake(True)  # pas de mise en veille pendant l'attente (relachee a la fin du processus)
             time.sleep(delay * 60)
             if not in_active_hours(cfg, now()):
                 log.info("Hors de la plage horaire apres le depart decale : aucune action")

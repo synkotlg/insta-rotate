@@ -24,7 +24,7 @@ bureau virtuel dedie.
 - `.\.venv\Scripts\python.exe insta_rotate.py login` : connexion manuelle unique, session gardee dans data\profile
   (demande aussi ton pseudo et l'ecrit dans config.json ; leve aussi l'arret "intervention requise")
 - `... insta_rotate.py run` : passe quotidienne (`--here` : fenetre visible sur le bureau courant ; `--force` : ignore
-  la plage horaire et le jour de repos, pour debugger)
+  la plage horaire, le jour de repos et l'heure de depart du jour, pour debugger)
 - `... insta_rotate.py check-seeds` : visite chaque source, ecarte celles qui n'existent pas
 - `... insta_rotate.py status` : compteurs, abonnements autorises aujourd'hui, follow-back, delai courant
 
@@ -74,9 +74,12 @@ bureau virtuel dedie.
   au-dela, follow-back gardes compris). Les pauses sont calees en moyenne sur 3600 / plafond effectif
   (`human_pause`) : apres une reaction d'Instagram le rythme ralentit vraiment ; `throttle()` attend ou arrete le
   passage.
-- Rafales (`human_pause`, demande explicite du 2026-11-06) : apres une pause normale, parfois 1 ou 2 actions
-  rapprochees (8 a 40 s), puis une pause plus longue qui rend le temps gagne (`_debt`) : le rythme moyen et les
-  plafonds horaires ne changent pas, seules certaines pauses sont plus courtes.
+- Rafales (`human_pause`, `next_burst`) : abonnements par rafales de `follow_burst` (3 a 8, au plus la moitie du
+  plafond horaire effectif : 3 a 5 apres un blocage) a `burst_gap_seconds` (4 a 15 s) d'intervalle, puis une longue
+  pause qui rend le temps gagne (`_debt`, environ 20 min a 20 par heure), demande explicite du 2026-11-26 ;
+  desabonnements : apres une pause normale, parfois 1 ou 2 actions rapprochees (8 a 40 s), demande du 2026-11-06.
+  Le rythme moyen et les plafonds horaires et sur 24 h ne changent pas, seules certaines pauses sont plus courtes.
+  Pause de plus de 5 min : `idle` en mode absent (gestes rares, absences plus longues).
 - Souris : tous les clics passent par `human_click` (molette jusqu'a l'element, trajectoire courbe `human_move`
   vers un point au hasard du bouton, courte pause, appui puis relache espaces), le defilement des listes par
   `scroll_dialog`, molette au-dessus de la partie qui defile (`JS_SCROLL_BOX`), jamais sur l'en-tete de la
@@ -118,8 +121,14 @@ bureau virtuel dedie.
   (elle reduisait navigator.languages et Accept-Language a une seule langue) : `--lang` pour l'interface, les
   langues annoncees sont celles du profil (fr-FR, fr, en-US, en). Fenetre de la taille de l'ecran (zone de
   travail), en haut a gauche ; jamais laissee a -32000 (position lisible depuis la page).
-- Depart decale : un passage planifie (sans `--here` ni `--force`) qui a du travail attend `start_delay_minutes`
-  (0 a 20 min) avant d'ouvrir le navigateur, pour ne pas commencer a la meme minute chaque heure.
+- Heure de depart du jour (`day_start`, demande du 2026-11-26) : tiree chaque jour au hasard dans `day_start_hours`
+  (9h-18h), gardee dans meta day_start:<date>. Un passage planifie (sans `--here` ni `--force`) n'agit pas avant :
+  plus de 65 min avant, il s'arrete ; dans l'heure d'avant (la tache relance toutes les heures), il attend l'heure
+  tiree (PC maintenu eveille). Avant, le bloc de 3 h commencait a 9h tous les matins. Un PC eteint avant l'heure
+  tiree fait une journee sans passage. `status` affiche l'heure du jour.
+- Depart decale : un passage planifie qui a du travail, apres l'heure de depart du jour, attend
+  `start_delay_minutes` (0 a 20 min) avant d'ouvrir le navigateur, pour ne pas commencer a la meme minute chaque
+  heure.
 - Restent visibles cote technique, sans correction propre : la connexion de pilotage de Playwright (detectable par
   des techniques avancees) et les scripts evalues dans la page elle-meme. Seul un Playwright modifie par des tiers
   les retirerait : pas fait.
@@ -167,7 +176,11 @@ bureau virtuel dedie.
 - `followback_stats()` : estimation Kaplan-Meier. Un compte desabonne sans follow-back est "censure" (observe
   jusqu'a ce jour), pas un echec. Delai retenu = plus petit nombre de jours qui capte `adapt_target_share` (90 %) des
   follow-back obtenus sur `unfollow_days_max`, borne par `unfollow_days_min` / `unfollow_days_max`.
-- Valeur courante dans meta.current_days. `unfollow_after_days` ne sert qu'au depart et tant que les donnees manquent.
+- `unfollow_days_min` = 7 depuis le 2026-11-26 (avant 2, delai descendu a 4 jours) : un abonnement de quelques
+  jours est la signature du suivre/desabonner, et les follow-back arrivent en 1 jour en mediane. Avec
+  `unfollow_days_max` = 7, le delai est donc fixe a 7 jours ; la mesure continue (statistiques, groupe temoin).
+- Valeur courante dans meta.current_days, jamais appliquee sous `unfollow_days_min` (`current_delay`).
+  `unfollow_after_days` (7) ne sert qu'au depart et tant que les donnees manquent.
 - Groupe temoin : `explore_share` (20 %) des nouveaux comptes ont `fixed_days = unfollow_days_max`. Ne pas le
   retirer : sans lui, une fois le delai raccourci, les follow-back tardifs ne sont plus observes.
 - L'ordre de la liste d'abonnes n'est pas fiable (pas chronologique) : elle est lue en entier, plafonnee a

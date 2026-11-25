@@ -1,7 +1,7 @@
 {
   "username": "",
   "follows_per_day": 100,
-  "unfollow_after_days": 5,
+  "unfollow_after_days": 7,
   "adaptive_delay": true,
   "virtual_desktop": 2,
   "browser_channel": "chrome"
